@@ -1390,7 +1390,7 @@ func (b *Block) ValidateMaxRlpSize(chainConfig *chain.Config) error {
 		return nil
 	}
 
-	if blockRlpSize := b.EncodingSize(); blockRlpSize > maxRlpSize {
+	if blockRlpSize := int(b.Size()); blockRlpSize > maxRlpSize {
 		return fmt.Errorf(
 			"block exceeds max rlp size: blockNum=%d, blockHash=%s, blockRlpSize=%d, maxRlpSize=%d",
 			b.NumberU64(),
