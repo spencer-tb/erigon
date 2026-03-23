@@ -581,25 +581,24 @@ func (evm *EVM) create(caller accounts.Address, codeAndHash *codeAndHash, gasRem
 	// be stored due to not enough gas, set an error when we're in Homestead and let it be handled
 	// by the error checking condition below.
 	if err == nil {
-		var stateGasOk bool
+		var stateGasOk, regularGasOk bool
 		var createDataGas uint64
 		if evm.chainRules.IsAmsterdam {
-			// EIP-8037: GAS_CODE_DEPOSIT = cpsb/byte (state) + 6*ceil(len/32) (regular)
-			// GAS_CREATE (112*cpsb) is already charged in stateGasCreate, no wasEmpty here
-			createDataGas = uint64(len(ret)) * evm.Context.CostPerStateByte // state gas cost
-			gasRemaining, stateGasOk = useMdGas(evm, gasRemaining, createDataGas, mdgas.StateGas, evm.Config().Tracer, tracing.GasChangeCallCodeStorage)
-			if stateGasOk {
-				createDataGas = 6 * ((uint64(len(ret)) + 31) / 32) // regular gas cost for hashing
+			// EIP-8037: GAS_CODE_DEPOSIT = 6*ceil(len/32) (regular) + cpsb/byte (state)
+			// Regular gas MUST be charged first (EIPs#11421).
+			// GAS_CREATE (112*cpsb) is already charged in stateGasCreate, no wasEmpty here.
+			createDataGas = 6 * ((uint64(len(ret)) + 31) / 32) // regular hash gas
+			gasRemaining, regularGasOk = useMdGas(evm, gasRemaining, createDataGas, mdgas.RegularGas, evm.Config().Tracer, tracing.GasChangeCallCodeStorage)
+			if regularGasOk {
+				createDataGas = uint64(len(ret)) * evm.Context.CostPerStateByte // state gas
+				gasRemaining, stateGasOk = useMdGas(evm, gasRemaining, createDataGas, mdgas.StateGas, evm.Config().Tracer, tracing.GasChangeCallCodeStorage)
 			}
 		} else {
 			createDataGas = uint64(len(ret)) * params.CreateDataGas
 			stateGasOk = true
-		}
-		var regularGasOk bool
-		if stateGasOk {
 			gasRemaining, regularGasOk = useMdGas(evm, gasRemaining, createDataGas, mdgas.RegularGas, evm.Config().Tracer, tracing.GasChangeCallCodeStorage)
 		}
-		if stateGasOk && regularGasOk {
+		if regularGasOk && stateGasOk {
 			evm.intraBlockState.SetCode(address, ret)
 		} else {
 			// If we run out of gas, we do not store the code: the returned code must be empty.
