@@ -137,11 +137,18 @@ func useMdGas(evm *EVM, initial mdgas.MdGas, gas uint64, t mdgas.MdGasType, trac
 			return initial, true
 		}
 		// otherwise use up all remaining state gas and try to use some from the regular gas
-		gas = gas - initial.State
+		spillRemainder := gas - initial.State
+		savedState := initial.State
 		initial.State = 0
-		initial.Regular, ok = useGas(initial.Regular, gas, tracer, reason)
-		if ok && evm != nil {
-			evm.stateGasConsumed += originalGas
+		initial.Regular, ok = useGas(initial.Regular, spillRemainder, tracer, reason)
+		if ok {
+			if evm != nil {
+				evm.stateGasConsumed += originalGas
+			}
+		} else {
+			// Restore state gas on failure: the charge didn't succeed,
+			// so the reservoir must not be consumed.
+			initial.State = savedState
 		}
 		return initial, ok
 	case mdgas.RegularGas:
