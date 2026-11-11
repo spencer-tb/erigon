@@ -2907,3 +2907,94 @@ func TestSimulateGasLimitAmsterdam(t *testing.T) {
 	require.ErrorAs(t, err, &rpcErr)
 	require.Equal(t, rpc.ErrCodeBlockGasLimitReached, rpcErr.ErrorCode())
 }
+
+// TestEstimateGasNestedCallFailures checks that eth_estimateGas does not return a gas limit that
+// starves a nested call which the caller catches, while a nested call that fails at any gas limit
+// leaves the estimate alone.
+func TestEstimateGasNestedCallFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		config *chain.Config
+	}{
+		{"osaka", chain.TestChainOsakaConfig},
+		{"amsterdam", chain.AllProtocolChanges},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bankKey, err := crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
+			require.NoError(t, err)
+			var (
+				bank    = crypto.PubkeyToAddress(bankKey.PublicKey)
+				burner  = common.HexToAddress("0x000000000000000000000000000000000000b001")
+				catcher = common.HexToAddress("0x000000000000000000000000000000000000ca01")
+				prober  = common.HexToAddress("0x000000000000000000000000000000000000ca02")
+			)
+			m := execmoduletester.New(t, execmoduletester.WithKey(bankKey), execmoduletester.WithGenesisSpec(&types.Genesis{
+				Config:   tc.config,
+				GasLimit: 60_000_000,
+				Alloc: types.GenesisAlloc{
+					bank: {Balance: big.NewInt(1e18)},
+					// Loops 3000 times, about 78,000 gas:
+					//   PUSH2 3000 JUMPDEST PUSH1 1 SWAP1 SUB DUP1 PUSH1 3 JUMPI STOP
+					burner: {Code: hexutil.MustDecode("0x610bb85b600190038060035700"), Balance: new(big.Int)},
+					// Calls the burner with all gas left and returns whether it succeeded:
+					//   PUSH1 0 x5 PUSH20 burner GAS CALL PUSH1 0 MSTORE PUSH1 32 PUSH1 0 RETURN
+					catcher: {Code: hexutil.MustDecode(fmt.Sprintf("0x6000600060006000600073%x5af160005260206000f3", burner)), Balance: new(big.Int)},
+					// Calls the burner with 1,000 gas, which always runs out, and returns whether
+					// it succeeded:
+					//   PUSH1 0 x5 PUSH20 burner PUSH2 1000 CALL PUSH1 0 MSTORE PUSH1 32 PUSH1 0 RETURN
+					prober: {Code: hexutil.MustDecode(fmt.Sprintf("0x6000600060006000600073%x6103e8f160005260206000f3", burner)), Balance: new(big.Int)},
+				},
+			}))
+			api := newEthApiForTest(newBaseApiForTest(m), m.DB, nil, nil)
+			ctx := context.Background()
+			latest := rpc.BlockNumberOrHashWithNumber(rpc.LatestBlockNumber)
+
+			// The estimate must leave the burner enough gas to finish.
+			args := ethapi.CallArgs{From: &bank, To: &catcher}
+			gas, err := api.EstimateGas(ctx, &args, &latest, nil, nil)
+			require.NoError(t, err)
+			args.Gas = &gas
+			out, err := api.Call(ctx, args, &latest, nil, nil)
+			require.NoError(t, err)
+			require.Equal(t, hexutil.Bytes(common.LeftPadBytes([]byte{1}, 32)), out, "nested call fails at estimate %d", gas)
+
+			// A nested call that runs out of gas at every limit must not inflate the estimate.
+			gas, err = api.EstimateGas(ctx, &ethapi.CallArgs{From: &bank, To: &prober}, &latest, nil, nil)
+			require.NoError(t, err)
+			require.LessOrEqual(t, uint64(gas), uint64(100_000), "estimate inflated by a nested call that always fails")
+		})
+	}
+}
+
+// TestEstimateGasNestedCallReservoirAmsterdam checks that after Amsterdam (EIP-8037) a nested call
+// that completes only with a state gas reservoir does not push the estimate past
+// params.MaxTxnGasLimit.
+func TestEstimateGasNestedCallReservoirAmsterdam(t *testing.T) {
+	bankKey, err := crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
+	require.NoError(t, err)
+	var (
+		bank    = crypto.PubkeyToAddress(bankKey.PublicKey)
+		storer  = common.HexToAddress("0x000000000000000000000000000000000000b002")
+		catcher = common.HexToAddress("0x000000000000000000000000000000000000ca03")
+	)
+	m := execmoduletester.New(t, execmoduletester.WithKey(bankKey), execmoduletester.WithGenesisSpec(&types.Genesis{
+		Config:   chain.AllProtocolChanges,
+		GasLimit: 60_000_000,
+		Alloc: types.GenesisAlloc{
+			bank: {Balance: big.NewInt(1e18)},
+			// Sets a fresh storage slot: PUSH1 1 PUSH1 0 SSTORE STOP
+			storer: {Code: hexutil.MustDecode("0x600160005500"), Balance: new(big.Int)},
+			// Calls the storer with 30,000 gas, too little for the new slot's state gas unless a
+			// reservoir pays it, and returns whether it succeeded:
+			//   PUSH1 0 x5 PUSH20 storer PUSH2 30000 CALL PUSH1 0 MSTORE PUSH1 32 PUSH1 0 RETURN
+			catcher: {Code: hexutil.MustDecode(fmt.Sprintf("0x6000600060006000600073%x617530f160005260206000f3", storer)), Balance: new(big.Int)},
+		},
+	}))
+	api := newEthApiForTest(newBaseApiForTest(m), m.DB, nil, nil)
+	api.GasCap = 50_000_000
+	latest := rpc.BlockNumberOrHashWithNumber(rpc.LatestBlockNumber)
+
+	gas, err := api.EstimateGas(context.Background(), &ethapi.CallArgs{From: &bank, To: &catcher}, &latest, nil, nil)
+	require.NoError(t, err)
+	require.Less(t, uint64(gas), params.MaxTxnGasLimit, "estimate reaches past MaxTxnGasLimit to fund the nested call from the reservoir")
+}
