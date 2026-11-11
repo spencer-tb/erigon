@@ -3024,6 +3024,84 @@ func TestEstimateGasNestedCallReservoirAmsterdam(t *testing.T) {
 	require.Less(t, uint64(gas), params.MaxTxnGasLimit, "estimate reaches past MaxTxnGasLimit to fund the nested call from the reservoir")
 }
 
+// TestEstimateGasNestedCreationsAboveMaxTxnGasLimitAmsterdam checks that after Amsterdam (EIP-8037)
+// the estimate of a deployment that needs more than params.MaxTxnGasLimit leaves each of its two
+// nested creations of 24,576 bytes enough gas, although both fail at params.MaxTxnGasLimit and the
+// deployment ignores their results.
+func TestEstimateGasNestedCreationsAboveMaxTxnGasLimitAmsterdam(t *testing.T) {
+	bankKey, err := crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
+	require.NoError(t, err)
+	var (
+		bank   = crypto.PubkeyToAddress(bankKey.PublicKey)
+		helper = common.HexToAddress("0x000000000000000000000000000000000000c0e1")
+	)
+	// child returns 24,576 zero bytes: PUSH2 24576 PUSH1 0 RETURN
+	// storeChild puts child at memory[26:32]: PUSH6 child PUSH1 0 MSTORE
+	// create creates child: PUSH1 6 PUSH1 26 PUSH1 0 CREATE
+	const (
+		storeChild = "656160006000f3600052"
+		create     = "6006601a6000f0"
+	)
+	m := execmoduletester.New(t, execmoduletester.WithKey(bankKey), execmoduletester.WithGenesisSpec(&types.Genesis{
+		Config:   chain.AllProtocolChanges,
+		GasLimit: 120_000_000,
+		Alloc: types.GenesisAlloc{
+			bank: {Balance: new(big.Int).Mul(big.NewInt(100), big.NewInt(1e18))},
+			// Creates child and returns its address, zero if the creation failed:
+			//   storeChild create PUSH1 0 MSTORE PUSH1 32 PUSH1 0 RETURN
+			helper: {Code: hexutil.MustDecode("0x" + storeChild + create + "60005260206000f3"), Balance: new(big.Int)},
+		},
+	}))
+	api := newEthApiForTest(newBaseApiForTest(m), m.DB, nil, nil)
+	ctx := context.Background()
+	latest := rpc.BlockNumberOrHashWithNumber(rpc.LatestBlockNumber)
+
+	for _, tc := range []struct {
+		name     string
+		initCode string
+	}{
+		{
+			// Creates child twice and logs both addresses:
+			//   storeChild create create PUSH1 32 MSTORE PUSH1 0 MSTORE PUSH1 64 PUSH1 0 LOG0 STOP
+			name:     "two creations",
+			initCode: "0x" + storeChild + create + create + "60205260005260406000a000",
+		},
+		{
+			// Creates child, then calls the helper with 200,000 gas, too little for the second code
+			// deposit unless the reservoir pays it, and logs both addresses:
+			//   storeChild create
+			//   PUSH1 32 PUSH1 32 PUSH1 0 PUSH1 0 PUSH1 0 PUSH20 helper PUSH3 200000 CALL POP
+			//   PUSH1 0 MSTORE PUSH1 64 PUSH1 0 LOG0 STOP
+			name:     "second creation in a call with fixed gas",
+			initCode: fmt.Sprintf("0x%s%s6020602060006000600073%x62030d40f15060005260406000a000", storeChild, create, helper),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			initCode := hexutil.Bytes(hexutil.MustDecode(tc.initCode))
+			gas, err := api.EstimateGas(ctx, &ethapi.CallArgs{From: &bank, Input: &initCode}, &latest, nil, nil)
+			require.NoError(t, err)
+			require.Greater(t, uint64(gas), params.MaxTxnGasLimit)
+
+			// Both creations succeed when the deployment runs at the estimate as a transaction in a
+			// block.
+			res, err := api.SimulateV1(ctx, SimulationRequest{
+				BlockStateCalls: []SimulatedBlock{{Calls: []ethapi.CallArgs{{
+					From: &bank, Input: &initCode, Gas: &gas, MaxFeePerGas: (*hexutil.U256)(uint256.NewInt(100e9)),
+				}}}},
+				Validation: true,
+			}, latest)
+			require.NoError(t, err)
+			call := res[0].Calls[0]
+			require.Equal(t, hexutil.Uint64(types.ReceiptStatusSuccessful), call.Status, "%v", call.Error)
+			require.Len(t, call.Logs, 1)
+			created := call.Logs[0].Data
+			require.Len(t, created, 64)
+			require.NotEqual(t, common.Address{}, common.BytesToAddress(created[:32]), "first creation fails at estimate %d", gas)
+			require.NotEqual(t, common.Address{}, common.BytesToAddress(created[32:]), "second creation fails at estimate %d", gas)
+		})
+	}
+}
+
 // TestGasCapAtLeastBlockGasLimit checks that eth_call, eth_estimateGas and eth_simulateV1 never cap
 // a call with an explicit gas below the block gas limit, so a transaction that fits in the block
 // can be executed when the RPC gas cap is lower, that a call without gas still defaults to the cap,

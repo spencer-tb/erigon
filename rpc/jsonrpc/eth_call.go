@@ -381,14 +381,22 @@ func (api *APIImpl) EstimateGas(ctx context.Context, argsOrNil *ethapi2.CallArgs
 	//
 	// After Amsterdam, gas above params.MaxTxnGasLimit only feeds the state gas
 	// reservoir. A call that completes an inner call only with a reservoir would
-	// otherwise be sized past params.MaxTxnGasLimit, so the execution at
-	// params.MaxTxnGasLimit is the reference when it succeeds.
-	allowedFailures := failedCalls
+	// otherwise be sized past params.MaxTxnGasLimit, so for gas limits up to
+	// params.MaxTxnGasLimit the execution at params.MaxTxnGasLimit is also a
+	// reference when it succeeds. Gas limits above it keep the count at hi, so a
+	// transaction that needs a reservoir gets one for all its nested calls.
+	cappedFailures := failedCalls
 	if chainConfig.IsAmsterdam(effectiveHeader.Time) && hi > params.MaxTxnGasLimit {
 		cappedFailed, cappedCalls, _, cappedErr := doCall(ctx, caller, params.MaxTxnGasLimit, -1, engine)
-		if cappedErr == nil && !cappedFailed && cappedCalls > allowedFailures {
-			allowedFailures = cappedCalls
+		if cappedErr == nil && !cappedFailed {
+			cappedFailures = max(failedCalls, cappedCalls)
 		}
+	}
+	allowedFailures := func(gasLimit uint64) int {
+		if gasLimit <= params.MaxTxnGasLimit {
+			return cappedFailures
+		}
+		return failedCalls
 	}
 
 	// above lower-bounds the gas limit required for it to succeed. One exception
@@ -403,7 +411,7 @@ func (api *APIImpl) EstimateGas(ctx context.Context, argsOrNil *ethapi2.CallArgs
 	// binary search.
 	optimisticGasLimit := (result.MaxGasUsed + params.CallStipend) * 64 / 63
 	if optimisticGasLimit < hi {
-		failed, _, _, err := doCall(ctx, caller, optimisticGasLimit, allowedFailures, engine)
+		failed, _, _, err := doCall(ctx, caller, optimisticGasLimit, allowedFailures(optimisticGasLimit), engine)
 		if err != nil {
 			return 0, err
 		}
@@ -424,7 +432,7 @@ func (api *APIImpl) EstimateGas(ctx context.Context, argsOrNil *ethapi2.CallArgs
 			// require near the full block limit of gas, so the selection of where to bisect the
 			// range here is skewed to favor the low side.
 			lo*2)
-		failed, _, _, err := doCall(ctx, caller, mid, allowedFailures, engine)
+		failed, _, _, err := doCall(ctx, caller, mid, allowedFailures(mid), engine)
 		// If the error is not nil(consensus error), it means the provided message
 		// call or transaction will never be accepted no matter how much gas it is
 		// assigned. Return the error directly, don't struggle any more.
