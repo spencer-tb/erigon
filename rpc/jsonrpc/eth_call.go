@@ -97,6 +97,18 @@ const (
 	maxGetProofKeys = 1024
 )
 
+// effectiveGasCap returns the RPC gas cap to apply at the block of header. A
+// transaction that fits in the block can be included, so it can also be
+// executed: a non-zero cap below the block gas limit is raised to it. header
+// must be the block's own header, not one with block overrides applied, so
+// that a request cannot lift the cap by overriding the gas limit.
+func effectiveGasCap(gasCap uint64, header *types.Header) uint64 {
+	if gasCap == 0 || header == nil {
+		return gasCap
+	}
+	return max(gasCap, header.GasLimit)
+}
+
 // Call implements eth_call. Executes a new message call immediately without creating a transaction on the block chain.
 func (api *APIImpl) Call(ctx context.Context, args ethapi2.CallArgs, requestedBlock *rpc.BlockNumberOrHash, stateOverrides *ethapi2.StateOverrides, blockOverrides *ethapi2.BlockOverrides) (hexutil.Bytes, error) {
 	blockNrOrHash := blockOrLatest(requestedBlock)
@@ -146,7 +158,10 @@ func (api *APIImpl) Call(ctx context.Context, args ethapi2.CallArgs, requestedBl
 		return nil, err
 	}
 
-	result, err := transactions.DoCall(ctx, engine, args, tx, blockNrOrHash, header, stateOverrides, blockOverrides, api.GasCap, chainConfig, stateReader, api._blockReader, api.evmCallTimeout)
+	// A call that asks for more gas than the cap may still get up to the block gas
+	// limit. Without an explicit gas, the default above stays the cap.
+	gasCap := effectiveGasCap(api.GasCap, header)
+	result, err := transactions.DoCall(ctx, engine, args, tx, blockNrOrHash, header, stateOverrides, blockOverrides, gasCap, chainConfig, stateReader, api._blockReader, api.evmCallTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -207,6 +222,8 @@ func (api *APIImpl) EstimateGas(ctx context.Context, argsOrNil *ethapi2.CallArgs
 	// Use overridden header for fork-detection and gas ceiling; keep original for
 	// DB lookups (state reader, prune history) which must reference the on-chain block.
 	effectiveHeader := blockOverrides.OverrideHeader(header)
+	// The search can reach the block gas limit of the on-chain block whatever the cap.
+	gasCap := effectiveGasCap(api.GasCap, header)
 
 	blockNum := header.Number
 
@@ -260,7 +277,7 @@ func (api *APIImpl) EstimateGas(ctx context.Context, argsOrNil *ethapi2.CallArgs
 		feeCap = common.Big0
 	}
 
-	caller, err := transactions.NewReusableCaller(engine, stateReader, stateOverrides, blockOverrides, effectiveHeader, args, api.GasCap, *blockNrOrHash, dbtx, api._blockReader, chainConfig, api.evmCallTimeout)
+	caller, err := transactions.NewReusableCaller(engine, stateReader, stateOverrides, blockOverrides, effectiveHeader, args, gasCap, *blockNrOrHash, dbtx, api._blockReader, chainConfig, api.evmCallTimeout)
 	if err != nil {
 		return 0, err
 	}
@@ -313,9 +330,9 @@ func (api *APIImpl) EstimateGas(ctx context.Context, argsOrNil *ethapi2.CallArgs
 	}
 
 	// Recap the highest gas allowance with specified gascap.
-	if hi > api.GasCap {
-		log.Warn("Caller gas above allowance, capping", "requested", hi, "cap", api.GasCap)
-		hi = api.GasCap
+	if gasCap != 0 && hi > gasCap {
+		log.Warn("Caller gas above allowance, capping", "requested", hi, "cap", gasCap)
+		hi = gasCap
 	}
 
 	// If the transaction is a plain value transfer, short circuit estimation and

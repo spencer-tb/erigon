@@ -2874,6 +2874,31 @@ func TestExecutionGasCapAmsterdam(t *testing.T) {
 			requireGasLeft(t, hexutil.MustDecode(call.ReturnData))
 		})
 	}
+	// The split is the same with an RPC gas cap below the gas of the calls, since the cap never
+	// limits a call below the block gas limit.
+	t.Run("gas cap below the call gas", func(t *testing.T) {
+		lowCap := newEthApiForTest(newBaseApiForTest(m), m.DB, nil, nil)
+		lowCap.GasCap = 10_000_000
+		ret, err := lowCap.Call(ctx, args, &latest, nil, nil)
+		require.NoError(t, err)
+		requireGasLeft(t, ret)
+		estimate, err := lowCap.EstimateGas(ctx, &args, &latest, nil, nil)
+		require.Error(t, err, "estimate %d", estimate)
+		for _, validation := range []bool{false, true} {
+			res, err := lowCap.SimulateV1(ctx, SimulationRequest{
+				BlockStateCalls: []SimulatedBlock{{Calls: []ethapi.CallArgs{args}}},
+				Validation:      validation,
+			}, latest)
+			require.NoError(t, err)
+			call := res[0].Calls[0]
+			if validation {
+				require.Equal(t, hexutil.Uint64(types.ReceiptStatusFailed), call.Status)
+				continue
+			}
+			require.Equal(t, hexutil.Uint64(types.ReceiptStatusSuccessful), call.Status, "%v", call.Error)
+			requireGasLeft(t, hexutil.MustDecode(call.ReturnData))
+		}
+	})
 }
 
 // TestSimulateGasLimitAmsterdam checks that after Amsterdam (EIP-8037) the default and the maximum gas of a
@@ -2997,4 +3022,103 @@ func TestEstimateGasNestedCallReservoirAmsterdam(t *testing.T) {
 	gas, err := api.EstimateGas(context.Background(), &ethapi.CallArgs{From: &bank, To: &catcher}, &latest, nil, nil)
 	require.NoError(t, err)
 	require.Less(t, uint64(gas), params.MaxTxnGasLimit, "estimate reaches past MaxTxnGasLimit to fund the nested call from the reservoir")
+}
+
+// TestGasCapAtLeastBlockGasLimit checks that eth_call, eth_estimateGas and eth_simulateV1 never cap
+// a call with an explicit gas below the block gas limit, so a transaction that fits in the block
+// can be executed when the RPC gas cap is lower, that a call without gas still defaults to the cap,
+// and that a block override of the gas limit does not lift the cap.
+func TestGasCapAtLeastBlockGasLimit(t *testing.T) {
+	const (
+		threshold = 12_000_000 // Gas the contract needs at entry, above the RPC gas cap
+		gasCap    = 10_000_000 // RPC gas cap
+		blockGas  = 30_000_000 // Block gas limit, above the cap
+	)
+	bankKey, err := crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
+	require.NoError(t, err)
+	var (
+		bank      = crypto.PubkeyToAddress(bankKey.PublicKey)
+		needsGas  = common.HexToAddress("0x000000000000000000000000000000000000c0de")
+		gasAtCall = common.HexToAddress("0x000000000000000000000000000000000000c0df")
+		burnsAll  = common.HexToAddress("0x000000000000000000000000000000000000c0e0")
+	)
+	m := execmoduletester.New(t, execmoduletester.WithKey(bankKey), execmoduletester.WithGenesisSpec(&types.Genesis{
+		Config:   chain.AllProtocolChanges,
+		GasLimit: blockGas,
+		Alloc: types.GenesisAlloc{
+			bank: {Balance: new(big.Int).Mul(big.NewInt(10), big.NewInt(1e18))},
+			// Returns the gas left at entry if it is at least threshold, reverts otherwise:
+			//   GAS PUSH4 threshold DUP2 LT PUSH1 0x11 JUMPI
+			//   PUSH0 MSTORE PUSH1 0x20 PUSH0 RETURN
+			//   JUMPDEST PUSH0 PUSH0 REVERT
+			needsGas: {Code: hexutil.MustDecode("0x5a6300b71b0081106011575f5260205ff35b5f5ffd"), Balance: new(big.Int)},
+			// Returns the gas left at entry: GAS PUSH0 MSTORE PUSH1 0x20 PUSH0 RETURN
+			gasAtCall: {Code: hexutil.MustDecode("0x5a5f5260205ff3"), Balance: new(big.Int)},
+			// Halts on an invalid opcode, which takes all its gas: INVALID
+			burnsAll: {Code: hexutil.MustDecode("0xfe"), Balance: new(big.Int)},
+		},
+	}))
+	api := newEthApiForTest(newBaseApiForTest(m), m.DB, nil, nil)
+	api.GasCap = gasCap
+	ctx := context.Background()
+	latest := rpc.BlockNumberOrHashWithNumber(rpc.LatestBlockNumber)
+	gasLeft := func(t *testing.T, ret []byte) uint64 {
+		t.Helper()
+		require.Len(t, ret, 32)
+		return new(uint256.Int).SetBytes(ret).Uint64()
+	}
+	explicit := hexutil.Uint64(20_000_000)
+	huge := hexutil.Uint64(1_000_000_000)
+	withGas := ethapi.CallArgs{From: &bank, To: &needsGas, Gas: &explicit}
+	withoutGas := ethapi.CallArgs{From: &bank, To: &gasAtCall}
+	withHugeGas := ethapi.CallArgs{From: &bank, To: &gasAtCall, Gas: &huge}
+
+	t.Run("eth_call", func(t *testing.T) {
+		// An explicit gas above the cap is allowed up to the block gas limit.
+		_, err := api.Call(ctx, withGas, &latest, nil, nil)
+		require.NoError(t, err)
+		// Without an explicit gas, the default stays the cap.
+		ret, err := api.Call(ctx, withoutGas, &latest, nil, nil)
+		require.NoError(t, err)
+		require.LessOrEqual(t, gasLeft(t, ret), uint64(gasCap))
+		// A larger block gas limit set through block overrides does not lift the cap.
+		ret, err = api.Call(ctx, withHugeGas, &latest, nil, &ethapi.BlockOverrides{GasLimit: &huge})
+		require.NoError(t, err)
+		require.LessOrEqual(t, gasLeft(t, ret), uint64(blockGas))
+	})
+	t.Run("eth_estimateGas", func(t *testing.T) {
+		// The search reaches the block gas limit.
+		gas, err := api.EstimateGas(ctx, &ethapi.CallArgs{From: &bank, To: &needsGas}, &latest, nil, nil)
+		require.NoError(t, err)
+		require.GreaterOrEqual(t, uint64(gas), uint64(threshold))
+		require.LessOrEqual(t, uint64(gas), uint64(blockGas))
+	})
+	t.Run("eth_simulateV1", func(t *testing.T) {
+		simulate := func(t *testing.T, blocks ...SimulatedBlock) []ethapi.CallResult {
+			t.Helper()
+			res, err := api.SimulateV1(ctx, SimulationRequest{BlockStateCalls: blocks}, latest)
+			require.NoError(t, err)
+			var calls []ethapi.CallResult
+			for _, block := range res {
+				calls = append(calls, block.Calls...)
+			}
+			for i, call := range calls {
+				require.Equal(t, hexutil.Uint64(types.ReceiptStatusSuccessful), call.Status, "call %d: %v", i, call.Error)
+			}
+			return calls
+		}
+		// An explicit gas above the cap is allowed up to the block gas limit.
+		simulate(t, SimulatedBlock{Calls: []ethapi.CallArgs{withGas}})
+		// Without an explicit gas, the default stays the cap.
+		calls := simulate(t, SimulatedBlock{Calls: []ethapi.CallArgs{withoutGas}})
+		require.LessOrEqual(t, gasLeft(t, hexutil.MustDecode(calls[0].ReturnData)), uint64(gasCap))
+		// A larger block gas limit set through block overrides does not lift the cap.
+		calls = simulate(t, SimulatedBlock{BlockOverrides: &ethapi.BlockOverrides{GasLimit: &huge}, Calls: []ethapi.CallArgs{withHugeGas}})
+		require.LessOrEqual(t, gasLeft(t, hexutil.MustDecode(calls[0].ReturnData)), uint64(blockGas))
+		// A call with an explicit gas above the cap takes its gas off the cap too, so a call
+		// without gas after it finds the cap used up.
+		burn := ethapi.CallArgs{From: &bank, To: &burnsAll, Gas: &explicit}
+		_, err := api.SimulateV1(ctx, SimulationRequest{BlockStateCalls: []SimulatedBlock{{Calls: []ethapi.CallArgs{burn, withoutGas}}}}, latest)
+		require.ErrorContains(t, err, protocol.ErrGasLimitReached.Error())
+	})
 }
