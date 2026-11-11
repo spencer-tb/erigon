@@ -264,6 +264,10 @@ func (api *APIImpl) EstimateGas(ctx context.Context, argsOrNil *ethapi2.CallArgs
 		// In Amsterdam (EIP-8037), transactions can provide state gas via a total gas limit > MaxTxnGasLimit.
 		hi = params.MaxTxnGasLimit
 	}
+	if hi > params.MaxTxnTotalGasLimit && chainConfig.IsAmsterdam(effectiveHeader.Time) {
+		// Cap the maximum gas allowance at the total gas limit of a transaction in Amsterdam (EIP-8037).
+		hi = params.MaxTxnTotalGasLimit
+	}
 
 	var feeCap *big.Int
 	switch {

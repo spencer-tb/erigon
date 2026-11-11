@@ -3102,6 +3102,24 @@ func TestEstimateGasNestedCreationsAboveMaxTxnGasLimitAmsterdam(t *testing.T) {
 	}
 }
 
+// TestEstimateGasTotalGasLimitAmsterdam checks that after Amsterdam (EIP-8037) the highest gas
+// limit of the estimate is at most params.MaxTxnTotalGasLimit, so a request gas above it is
+// lowered to it when the RPC gas cap does not bound it.
+func TestEstimateGasTotalGasLimitAmsterdam(t *testing.T) {
+	m, _, bank := fundedBankGenesis(t, chain.AllProtocolChanges)
+	// --rpc.gascap=0 disables the RPC gas cap.
+	api := NewEthAPI(newBaseApiForTest(m), m.DB, nil, nil, nil, &rpccfg.EthApiConfig{GasCap: 0}, log.New())
+	// Loops forever, so it runs out of gas at every gas limit: JUMPDEST PUSH1 0 JUMP
+	burner := common.HexToAddress("0x000000000000000000000000000000000000c0e3")
+	code := hexutil.Bytes(hexutil.MustDecode("0x5b600056"))
+	overrides := &ethapi.StateOverrides{accounts.InternAddress(burner): {Code: &code}}
+	latest := rpc.BlockNumberOrHashWithNumber(rpc.LatestBlockNumber)
+
+	gas := hexutil.Uint64(2 * params.MaxTxnTotalGasLimit)
+	_, err := api.EstimateGas(context.Background(), &ethapi.CallArgs{From: &bank, To: &burner, Gas: &gas}, &latest, overrides, nil)
+	require.EqualError(t, err, fmt.Sprintf("gas required exceeds allowance (%d)", params.MaxTxnTotalGasLimit))
+}
+
 // TestGasCapAtLeastBlockGasLimit checks that eth_call, eth_estimateGas and eth_simulateV1 never cap
 // a call with an explicit gas below the block gas limit, so a transaction that fits in the block
 // can be executed when the RPC gas cap is lower, that a call without gas still defaults to the cap,
