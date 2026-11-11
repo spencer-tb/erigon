@@ -32,6 +32,7 @@ import (
 	"github.com/erigontech/erigon/execution/protocol"
 	"github.com/erigontech/erigon/execution/protocol/rules"
 	"github.com/erigontech/erigon/execution/state"
+	"github.com/erigontech/erigon/execution/tracing"
 	"github.com/erigontech/erigon/execution/types"
 	"github.com/erigontech/erigon/execution/types/accounts"
 	"github.com/erigontech/erigon/execution/vm"
@@ -187,6 +188,9 @@ type ReusableCaller struct {
 	rules          *chain.Rules
 	callTimeout    time.Duration
 	message        *types.Message
+	// failedCalls counts the nested calls and creations of the last
+	// DoCallWithNewGas that ended in an error, reverts included.
+	failedCalls int
 }
 
 // Close returns the state built by the last DoCallWithNewGas to its pools.
@@ -198,6 +202,20 @@ func (r *ReusableCaller) Close() {
 }
 
 func (r *ReusableCaller) Message() *types.Message { return r.message }
+
+// FailedCalls returns how many nested calls and creations of the last
+// DoCallWithNewGas ended in an error, reverts included. eth_estimateGas reads it
+// to tell a sufficient gas limit apart from one that starves an inner call.
+func (r *ReusableCaller) FailedCalls() int { return r.failedCalls }
+
+// onExit counts the nested frames that end in an error. An exit hook alone
+// keeps the interpreter off its traced loop, which only opcode, gas change and
+// fault hooks select.
+func (r *ReusableCaller) onExit(depth int, _ []byte, _ uint64, err error, _ bool) {
+	if depth > 0 && err != nil {
+		r.failedCalls++
+	}
+}
 
 // VersionedCallState puts a one-shot call on the versioned state path block execution
 // uses. Reset clears the flags, so a reused state calls this again.
@@ -289,6 +307,7 @@ func (r *ReusableCaller) DoCallWithNewGas(
 
 	gp := new(protocol.GasPool).AddGas(r.message.Gas()).AddBlobGas(r.message.BlobGas())
 
+	r.failedCalls = 0
 	result, err := protocol.ApplyMessage(r.evm, r.message, gp, true /* refunds */, false /* gasBailout */, engine)
 	if err != nil {
 		return nil, err
@@ -332,12 +351,8 @@ func NewReusableCaller(
 	}
 	initialArgs.ZeroUnpricedBlobBaseFee(&blockCtx)
 	txCtx := protocol.NewEVMTxContext(msg)
-	vmConfig := vm.Config{NoBaseFee: true, NoReceipts: true, NoBAL: true}
 
-	evm := vm.NewEVM(vm.ZeroUnpricedBaseFee(blockCtx, txCtx, vmConfig), txCtx, state.NewPooled(stateReader), chainConfig, vmConfig)
-
-	return &ReusableCaller{
-		evm:            evm,
+	r := &ReusableCaller{
 		baseFee:        baseFee,
 		gasCap:         gasCap,
 		callTimeout:    callTimeout,
@@ -345,5 +360,8 @@ func NewReusableCaller(
 		stateOverrides: stateOverrides,
 		rules:          blockCtx.Rules(chainConfig),
 		message:        msg,
-	}, nil
+	}
+	vmConfig := vm.Config{NoBaseFee: true, NoReceipts: true, NoBAL: true, Tracer: &tracing.Hooks{OnExit: r.onExit}}
+	r.evm = vm.NewEVM(vm.ZeroUnpricedBaseFee(blockCtx, txCtx, vmConfig), txCtx, state.NewPooled(stateReader), chainConfig, vmConfig)
+	return r, nil
 }

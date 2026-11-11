@@ -97,6 +97,18 @@ const (
 	maxGetProofKeys = 1024
 )
 
+// effectiveGasCap returns the RPC gas cap to apply at the block of header. A
+// transaction that fits in the block can be included, so it can also be
+// executed: a non-zero cap below the block gas limit is raised to it. header
+// must be the block's own header, not one with block overrides applied, so
+// that a request cannot lift the cap by overriding the gas limit.
+func effectiveGasCap(gasCap uint64, header *types.Header) uint64 {
+	if gasCap == 0 || header == nil {
+		return gasCap
+	}
+	return max(gasCap, header.GasLimit)
+}
+
 // Call implements eth_call. Executes a new message call immediately without creating a transaction on the block chain.
 func (api *APIImpl) Call(ctx context.Context, args ethapi2.CallArgs, requestedBlock *rpc.BlockNumberOrHash, stateOverrides *ethapi2.StateOverrides, blockOverrides *ethapi2.BlockOverrides) (hexutil.Bytes, error) {
 	blockNrOrHash := blockOrLatest(requestedBlock)
@@ -146,7 +158,10 @@ func (api *APIImpl) Call(ctx context.Context, args ethapi2.CallArgs, requestedBl
 		return nil, err
 	}
 
-	result, err := transactions.DoCall(ctx, engine, args, tx, blockNrOrHash, header, stateOverrides, blockOverrides, api.GasCap, chainConfig, stateReader, api._blockReader, api.evmCallTimeout)
+	// A call that asks for more gas than the cap may still get up to the block gas
+	// limit. Without an explicit gas, the default above stays the cap.
+	gasCap := effectiveGasCap(api.GasCap, header)
+	result, err := transactions.DoCall(ctx, engine, args, tx, blockNrOrHash, header, stateOverrides, blockOverrides, gasCap, chainConfig, stateReader, api._blockReader, api.evmCallTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -162,7 +177,8 @@ func (api *APIImpl) Call(ctx context.Context, args ethapi2.CallArgs, requestedBl
 	return result.Return(), result.Err
 }
 
-// EstimateGas implements eth_estimateGas. Returns an estimate of how much gas is necessary to allow the transaction to complete. The transaction will not be added to the blockchain.
+// EstimateGas implements eth_estimateGas. Returns an estimate of how much gas is necessary to allow the transaction to complete,
+// without more of its nested calls failing than when it is given ample gas. The transaction will not be added to the blockchain.
 func (api *APIImpl) EstimateGas(ctx context.Context, argsOrNil *ethapi2.CallArgs, blockNrOrHash *rpc.BlockNumberOrHash, stateOverrides *ethapi2.StateOverrides, blockOverrides *ethapi2.BlockOverrides) (hexutil.Uint64, error) {
 	var args ethapi2.CallArgs
 	// if we actually get CallArgs here, we use them
@@ -206,6 +222,8 @@ func (api *APIImpl) EstimateGas(ctx context.Context, argsOrNil *ethapi2.CallArgs
 	// Use overridden header for fork-detection and gas ceiling; keep original for
 	// DB lookups (state reader, prune history) which must reference the on-chain block.
 	effectiveHeader := blockOverrides.OverrideHeader(header)
+	// The search can reach the block gas limit of the on-chain block whatever the cap.
+	gasCap := effectiveGasCap(api.GasCap, header)
 
 	blockNum := header.Number
 
@@ -246,6 +264,10 @@ func (api *APIImpl) EstimateGas(ctx context.Context, argsOrNil *ethapi2.CallArgs
 		// In Amsterdam (EIP-8037), transactions can provide state gas via a total gas limit > MaxTxnGasLimit.
 		hi = params.MaxTxnGasLimit
 	}
+	if hi > params.MaxTxnTotalGasLimit && chainConfig.IsAmsterdam(effectiveHeader.Time) {
+		// Cap the maximum gas allowance at the total gas limit of a transaction in Amsterdam (EIP-8037).
+		hi = params.MaxTxnTotalGasLimit
+	}
 
 	var feeCap *big.Int
 	switch {
@@ -259,7 +281,7 @@ func (api *APIImpl) EstimateGas(ctx context.Context, argsOrNil *ethapi2.CallArgs
 		feeCap = common.Big0
 	}
 
-	caller, err := transactions.NewReusableCaller(engine, stateReader, stateOverrides, blockOverrides, effectiveHeader, args, api.GasCap, *blockNrOrHash, dbtx, api._blockReader, chainConfig, api.evmCallTimeout)
+	caller, err := transactions.NewReusableCaller(engine, stateReader, stateOverrides, blockOverrides, effectiveHeader, args, gasCap, *blockNrOrHash, dbtx, api._blockReader, chainConfig, api.evmCallTimeout)
 	if err != nil {
 		return 0, err
 	}
@@ -312,9 +334,9 @@ func (api *APIImpl) EstimateGas(ctx context.Context, argsOrNil *ethapi2.CallArgs
 	}
 
 	// Recap the highest gas allowance with specified gascap.
-	if hi > api.GasCap {
-		log.Warn("Caller gas above allowance, capping", "requested", hi, "cap", api.GasCap)
-		hi = api.GasCap
+	if gasCap != 0 && hi > gasCap {
+		log.Warn("Caller gas above allowance, capping", "requested", hi, "cap", gasCap)
+		hi = gasCap
 	}
 
 	// If the transaction is a plain value transfer, short circuit estimation and
@@ -333,7 +355,7 @@ func (api *APIImpl) EstimateGas(ctx context.Context, argsOrNil *ethapi2.CallArgs
 		// including EIP-2780's re-priced transfers (self=12000, zero-value=15000,
 		// account creation adds NEW_ACCOUNT state gas).
 		if codeSize == 0 {
-			failed, result, err := doCall(ctx, caller, hi, engine)
+			failed, _, result, err := doCall(ctx, caller, hi, -1, engine)
 			if err == nil && !failed {
 				return hexutil.Uint64(result.ReceiptGasUsed), nil
 			}
@@ -342,7 +364,7 @@ func (api *APIImpl) EstimateGas(ctx context.Context, argsOrNil *ethapi2.CallArgs
 
 	// We first execute the transaction at the highest allowable gas limit, since if this fails we
 	// can return error immediately.
-	failed, result, err := doCall(ctx, caller, hi, engine)
+	failed, failedCalls, result, err := doCall(ctx, caller, hi, -1, engine)
 	if err != nil {
 		return 0, err
 	}
@@ -355,6 +377,30 @@ func (api *APIImpl) EstimateGas(ctx context.Context, argsOrNil *ethapi2.CallArgs
 		}
 		// Otherwise, the specified gas cap is too low
 		return 0, fmt.Errorf("gas required exceeds allowance (%d)", hi)
+	}
+	// A gas limit only counts as sufficient if no more nested calls fail than in
+	// a reference execution. Otherwise the search can settle on a limit where an
+	// inner call runs out of gas, the caller catches the failure and the
+	// transaction succeeds while doing something else than intended.
+	//
+	// After Amsterdam, gas above params.MaxTxnGasLimit only feeds the state gas
+	// reservoir. A call that completes an inner call only with a reservoir would
+	// otherwise be sized past params.MaxTxnGasLimit, so for gas limits up to
+	// params.MaxTxnGasLimit the execution at params.MaxTxnGasLimit is also a
+	// reference when it succeeds. Gas limits above it keep the count at hi, so a
+	// transaction that needs a reservoir gets one for all its nested calls.
+	cappedFailures := failedCalls
+	if chainConfig.IsAmsterdam(effectiveHeader.Time) && hi > params.MaxTxnGasLimit {
+		cappedFailed, cappedCalls, _, cappedErr := doCall(ctx, caller, params.MaxTxnGasLimit, -1, engine)
+		if cappedErr == nil && !cappedFailed {
+			cappedFailures = max(failedCalls, cappedCalls)
+		}
+	}
+	allowedFailures := func(gasLimit uint64) int {
+		if gasLimit <= params.MaxTxnGasLimit {
+			return cappedFailures
+		}
+		return failedCalls
 	}
 
 	// above lower-bounds the gas limit required for it to succeed. One exception
@@ -369,7 +415,7 @@ func (api *APIImpl) EstimateGas(ctx context.Context, argsOrNil *ethapi2.CallArgs
 	// binary search.
 	optimisticGasLimit := (result.MaxGasUsed + params.CallStipend) * 64 / 63
 	if optimisticGasLimit < hi {
-		failed, _, err := doCall(ctx, caller, optimisticGasLimit, engine)
+		failed, _, _, err := doCall(ctx, caller, optimisticGasLimit, allowedFailures(optimisticGasLimit), engine)
 		if err != nil {
 			return 0, err
 		}
@@ -390,7 +436,7 @@ func (api *APIImpl) EstimateGas(ctx context.Context, argsOrNil *ethapi2.CallArgs
 			// require near the full block limit of gas, so the selection of where to bisect the
 			// range here is skewed to favor the low side.
 			lo*2)
-		failed, _, err := doCall(ctx, caller, mid, engine)
+		failed, _, _, err := doCall(ctx, caller, mid, allowedFailures(mid), engine)
 		// If the error is not nil(consensus error), it means the provided message
 		// call or transaction will never be accepted no matter how much gas it is
 		// assigned. Return the error directly, don't struggle any more.
@@ -406,24 +452,27 @@ func (api *APIImpl) EstimateGas(ctx context.Context, argsOrNil *ethapi2.CallArgs
 	return hexutil.Uint64(hi), nil
 }
 
-// execute is a helper that executes the transaction under a given gas limit and
+// doCall is a helper that executes the transaction under a given gas limit and
 // returns true if the transaction fails for a reason that might be related to
-// not enough gas. A non-nil error means execution failed due to reasons unrelated
-// to the gas limit.
-func doCall(ctx context.Context, caller *transactions.ReusableCaller, gasLimit uint64, engine rules.EngineReader) (bool, *evmtypes.ExecutionResult, error) {
+// not enough gas: the transaction itself fails, or more than maxFailedCalls of
+// its nested calls fail (a negative maxFailedCalls skips that check). It also
+// returns how many nested calls failed. A non-nil error means execution failed
+// due to reasons unrelated to the gas limit.
+func doCall(ctx context.Context, caller *transactions.ReusableCaller, gasLimit uint64, maxFailedCalls int, engine rules.EngineReader) (bool, int, *evmtypes.ExecutionResult, error) {
 	result, err := caller.DoCallWithNewGas(ctx, gasLimit, engine)
 	if err != nil {
 		if errors.Is(err, protocol.ErrIntrinsicGas) {
-			return true, nil, nil // Special case, raise gas limit
+			return true, 0, nil, nil // Special case, raise gas limit
 		}
 
 		if errors.Is(err, protocol.ErrGasLimitTooHigh) {
-			return true, nil, nil // Special case, lower gas limit
+			return true, 0, nil, nil // Special case, lower gas limit
 		}
-		return true, nil, err
+		return true, 0, nil, err
 	}
-	failed := result.Failed()
-	return failed, result, nil
+	failedCalls := caller.FailedCalls()
+	failed := result.Failed() || (maxFailedCalls >= 0 && failedCalls > maxFailedCalls)
+	return failed, failedCalls, result, nil
 }
 
 type StorageKeysInfo struct {

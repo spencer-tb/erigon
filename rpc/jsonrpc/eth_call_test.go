@@ -2874,6 +2874,31 @@ func TestExecutionGasCapAmsterdam(t *testing.T) {
 			requireGasLeft(t, hexutil.MustDecode(call.ReturnData))
 		})
 	}
+	// The split is the same with an RPC gas cap below the gas of the calls, since the cap never
+	// limits a call below the block gas limit.
+	t.Run("gas cap below the call gas", func(t *testing.T) {
+		lowCap := newEthApiForTest(newBaseApiForTest(m), m.DB, nil, nil)
+		lowCap.GasCap = 10_000_000
+		ret, err := lowCap.Call(ctx, args, &latest, nil, nil)
+		require.NoError(t, err)
+		requireGasLeft(t, ret)
+		estimate, err := lowCap.EstimateGas(ctx, &args, &latest, nil, nil)
+		require.Error(t, err, "estimate %d", estimate)
+		for _, validation := range []bool{false, true} {
+			res, err := lowCap.SimulateV1(ctx, SimulationRequest{
+				BlockStateCalls: []SimulatedBlock{{Calls: []ethapi.CallArgs{args}}},
+				Validation:      validation,
+			}, latest)
+			require.NoError(t, err)
+			call := res[0].Calls[0]
+			if validation {
+				require.Equal(t, hexutil.Uint64(types.ReceiptStatusFailed), call.Status)
+				continue
+			}
+			require.Equal(t, hexutil.Uint64(types.ReceiptStatusSuccessful), call.Status, "%v", call.Error)
+			requireGasLeft(t, hexutil.MustDecode(call.ReturnData))
+		}
+	})
 }
 
 // TestSimulateGasLimitAmsterdam checks that after Amsterdam (EIP-8037) the default and the maximum gas of a
@@ -2906,4 +2931,290 @@ func TestSimulateGasLimitAmsterdam(t *testing.T) {
 	var rpcErr rpc.Error
 	require.ErrorAs(t, err, &rpcErr)
 	require.Equal(t, rpc.ErrCodeBlockGasLimitReached, rpcErr.ErrorCode())
+}
+
+// TestEstimateGasNestedCallFailures checks that eth_estimateGas does not return a gas limit that
+// starves a nested call which the caller catches, while a nested call that fails at any gas limit
+// leaves the estimate alone.
+func TestEstimateGasNestedCallFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		config *chain.Config
+	}{
+		{"osaka", chain.TestChainOsakaConfig},
+		{"amsterdam", chain.AllProtocolChanges},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bankKey, err := crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
+			require.NoError(t, err)
+			var (
+				bank    = crypto.PubkeyToAddress(bankKey.PublicKey)
+				burner  = common.HexToAddress("0x000000000000000000000000000000000000b001")
+				catcher = common.HexToAddress("0x000000000000000000000000000000000000ca01")
+				prober  = common.HexToAddress("0x000000000000000000000000000000000000ca02")
+			)
+			m := execmoduletester.New(t, execmoduletester.WithKey(bankKey), execmoduletester.WithGenesisSpec(&types.Genesis{
+				Config:   tc.config,
+				GasLimit: 60_000_000,
+				Alloc: types.GenesisAlloc{
+					bank: {Balance: big.NewInt(1e18)},
+					// Loops 3000 times, about 78,000 gas:
+					//   PUSH2 3000 JUMPDEST PUSH1 1 SWAP1 SUB DUP1 PUSH1 3 JUMPI STOP
+					burner: {Code: hexutil.MustDecode("0x610bb85b600190038060035700"), Balance: new(big.Int)},
+					// Calls the burner with all gas left and returns whether it succeeded:
+					//   PUSH1 0 x5 PUSH20 burner GAS CALL PUSH1 0 MSTORE PUSH1 32 PUSH1 0 RETURN
+					catcher: {Code: hexutil.MustDecode(fmt.Sprintf("0x6000600060006000600073%x5af160005260206000f3", burner)), Balance: new(big.Int)},
+					// Calls the burner with 1,000 gas, which always runs out, and returns whether
+					// it succeeded:
+					//   PUSH1 0 x5 PUSH20 burner PUSH2 1000 CALL PUSH1 0 MSTORE PUSH1 32 PUSH1 0 RETURN
+					prober: {Code: hexutil.MustDecode(fmt.Sprintf("0x6000600060006000600073%x6103e8f160005260206000f3", burner)), Balance: new(big.Int)},
+				},
+			}))
+			api := newEthApiForTest(newBaseApiForTest(m), m.DB, nil, nil)
+			ctx := context.Background()
+			latest := rpc.BlockNumberOrHashWithNumber(rpc.LatestBlockNumber)
+
+			// The estimate must leave the burner enough gas to finish.
+			args := ethapi.CallArgs{From: &bank, To: &catcher}
+			gas, err := api.EstimateGas(ctx, &args, &latest, nil, nil)
+			require.NoError(t, err)
+			args.Gas = &gas
+			out, err := api.Call(ctx, args, &latest, nil, nil)
+			require.NoError(t, err)
+			require.Equal(t, hexutil.Bytes(common.LeftPadBytes([]byte{1}, 32)), out, "nested call fails at estimate %d", gas)
+
+			// A nested call that runs out of gas at every limit must not inflate the estimate.
+			gas, err = api.EstimateGas(ctx, &ethapi.CallArgs{From: &bank, To: &prober}, &latest, nil, nil)
+			require.NoError(t, err)
+			require.LessOrEqual(t, uint64(gas), uint64(100_000), "estimate inflated by a nested call that always fails")
+		})
+	}
+}
+
+// TestEstimateGasNestedCallReservoirAmsterdam checks that after Amsterdam (EIP-8037) a nested call
+// that completes only with a state gas reservoir does not push the estimate past
+// params.MaxTxnGasLimit.
+func TestEstimateGasNestedCallReservoirAmsterdam(t *testing.T) {
+	bankKey, err := crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
+	require.NoError(t, err)
+	var (
+		bank    = crypto.PubkeyToAddress(bankKey.PublicKey)
+		storer  = common.HexToAddress("0x000000000000000000000000000000000000b002")
+		catcher = common.HexToAddress("0x000000000000000000000000000000000000ca03")
+	)
+	m := execmoduletester.New(t, execmoduletester.WithKey(bankKey), execmoduletester.WithGenesisSpec(&types.Genesis{
+		Config:   chain.AllProtocolChanges,
+		GasLimit: 60_000_000,
+		Alloc: types.GenesisAlloc{
+			bank: {Balance: big.NewInt(1e18)},
+			// Sets a fresh storage slot: PUSH1 1 PUSH1 0 SSTORE STOP
+			storer: {Code: hexutil.MustDecode("0x600160005500"), Balance: new(big.Int)},
+			// Calls the storer with 30,000 gas, too little for the new slot's state gas unless a
+			// reservoir pays it, and returns whether it succeeded:
+			//   PUSH1 0 x5 PUSH20 storer PUSH2 30000 CALL PUSH1 0 MSTORE PUSH1 32 PUSH1 0 RETURN
+			catcher: {Code: hexutil.MustDecode(fmt.Sprintf("0x6000600060006000600073%x617530f160005260206000f3", storer)), Balance: new(big.Int)},
+		},
+	}))
+	api := newEthApiForTest(newBaseApiForTest(m), m.DB, nil, nil)
+	api.GasCap = 50_000_000
+	latest := rpc.BlockNumberOrHashWithNumber(rpc.LatestBlockNumber)
+
+	gas, err := api.EstimateGas(context.Background(), &ethapi.CallArgs{From: &bank, To: &catcher}, &latest, nil, nil)
+	require.NoError(t, err)
+	require.Less(t, uint64(gas), params.MaxTxnGasLimit, "estimate reaches past MaxTxnGasLimit to fund the nested call from the reservoir")
+}
+
+// TestEstimateGasNestedCreationsAboveMaxTxnGasLimitAmsterdam checks that after Amsterdam (EIP-8037)
+// the estimate of a deployment that needs more than params.MaxTxnGasLimit leaves each of its two
+// nested creations of 24,576 bytes enough gas, although both fail at params.MaxTxnGasLimit and the
+// deployment ignores their results.
+func TestEstimateGasNestedCreationsAboveMaxTxnGasLimitAmsterdam(t *testing.T) {
+	bankKey, err := crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
+	require.NoError(t, err)
+	var (
+		bank   = crypto.PubkeyToAddress(bankKey.PublicKey)
+		helper = common.HexToAddress("0x000000000000000000000000000000000000c0e1")
+	)
+	// child returns 24,576 zero bytes: PUSH2 24576 PUSH1 0 RETURN
+	// storeChild puts child at memory[26:32]: PUSH6 child PUSH1 0 MSTORE
+	// create creates child: PUSH1 6 PUSH1 26 PUSH1 0 CREATE
+	const (
+		storeChild = "656160006000f3600052"
+		create     = "6006601a6000f0"
+	)
+	m := execmoduletester.New(t, execmoduletester.WithKey(bankKey), execmoduletester.WithGenesisSpec(&types.Genesis{
+		Config:   chain.AllProtocolChanges,
+		GasLimit: 120_000_000,
+		Alloc: types.GenesisAlloc{
+			bank: {Balance: new(big.Int).Mul(big.NewInt(100), big.NewInt(1e18))},
+			// Creates child and returns its address, zero if the creation failed:
+			//   storeChild create PUSH1 0 MSTORE PUSH1 32 PUSH1 0 RETURN
+			helper: {Code: hexutil.MustDecode("0x" + storeChild + create + "60005260206000f3"), Balance: new(big.Int)},
+		},
+	}))
+	api := newEthApiForTest(newBaseApiForTest(m), m.DB, nil, nil)
+	ctx := context.Background()
+	latest := rpc.BlockNumberOrHashWithNumber(rpc.LatestBlockNumber)
+
+	for _, tc := range []struct {
+		name     string
+		initCode string
+	}{
+		{
+			// Creates child twice and logs both addresses:
+			//   storeChild create create PUSH1 32 MSTORE PUSH1 0 MSTORE PUSH1 64 PUSH1 0 LOG0 STOP
+			name:     "two creations",
+			initCode: "0x" + storeChild + create + create + "60205260005260406000a000",
+		},
+		{
+			// Creates child, then calls the helper with 200,000 gas, too little for the second code
+			// deposit unless the reservoir pays it, and logs both addresses:
+			//   storeChild create
+			//   PUSH1 32 PUSH1 32 PUSH1 0 PUSH1 0 PUSH1 0 PUSH20 helper PUSH3 200000 CALL POP
+			//   PUSH1 0 MSTORE PUSH1 64 PUSH1 0 LOG0 STOP
+			name:     "second creation in a call with fixed gas",
+			initCode: fmt.Sprintf("0x%s%s6020602060006000600073%x62030d40f15060005260406000a000", storeChild, create, helper),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			initCode := hexutil.Bytes(hexutil.MustDecode(tc.initCode))
+			gas, err := api.EstimateGas(ctx, &ethapi.CallArgs{From: &bank, Input: &initCode}, &latest, nil, nil)
+			require.NoError(t, err)
+			require.Greater(t, uint64(gas), params.MaxTxnGasLimit)
+
+			// Both creations succeed when the deployment runs at the estimate as a transaction in a
+			// block.
+			res, err := api.SimulateV1(ctx, SimulationRequest{
+				BlockStateCalls: []SimulatedBlock{{Calls: []ethapi.CallArgs{{
+					From: &bank, Input: &initCode, Gas: &gas, MaxFeePerGas: (*hexutil.U256)(uint256.NewInt(100e9)),
+				}}}},
+				Validation: true,
+			}, latest)
+			require.NoError(t, err)
+			call := res[0].Calls[0]
+			require.Equal(t, hexutil.Uint64(types.ReceiptStatusSuccessful), call.Status, "%v", call.Error)
+			require.Len(t, call.Logs, 1)
+			created := call.Logs[0].Data
+			require.Len(t, created, 64)
+			require.NotEqual(t, common.Address{}, common.BytesToAddress(created[:32]), "first creation fails at estimate %d", gas)
+			require.NotEqual(t, common.Address{}, common.BytesToAddress(created[32:]), "second creation fails at estimate %d", gas)
+		})
+	}
+}
+
+// TestEstimateGasTotalGasLimitAmsterdam checks that after Amsterdam (EIP-8037) the highest gas
+// limit of the estimate is at most params.MaxTxnTotalGasLimit, so a request gas above it is
+// lowered to it when the RPC gas cap does not bound it.
+func TestEstimateGasTotalGasLimitAmsterdam(t *testing.T) {
+	m, _, bank := fundedBankGenesis(t, chain.AllProtocolChanges)
+	// --rpc.gascap=0 disables the RPC gas cap.
+	api := NewEthAPI(newBaseApiForTest(m), m.DB, nil, nil, nil, &rpccfg.EthApiConfig{GasCap: 0}, log.New())
+	// Loops forever, so it runs out of gas at every gas limit: JUMPDEST PUSH1 0 JUMP
+	burner := common.HexToAddress("0x000000000000000000000000000000000000c0e3")
+	code := hexutil.Bytes(hexutil.MustDecode("0x5b600056"))
+	overrides := &ethapi.StateOverrides{accounts.InternAddress(burner): {Code: &code}}
+	latest := rpc.BlockNumberOrHashWithNumber(rpc.LatestBlockNumber)
+
+	gas := hexutil.Uint64(2 * params.MaxTxnTotalGasLimit)
+	_, err := api.EstimateGas(context.Background(), &ethapi.CallArgs{From: &bank, To: &burner, Gas: &gas}, &latest, overrides, nil)
+	require.EqualError(t, err, fmt.Sprintf("gas required exceeds allowance (%d)", params.MaxTxnTotalGasLimit))
+}
+
+// TestGasCapAtLeastBlockGasLimit checks that eth_call, eth_estimateGas and eth_simulateV1 never cap
+// a call with an explicit gas below the block gas limit, so a transaction that fits in the block
+// can be executed when the RPC gas cap is lower, that a call without gas still defaults to the cap,
+// and that a block override of the gas limit does not lift the cap.
+func TestGasCapAtLeastBlockGasLimit(t *testing.T) {
+	const (
+		threshold = 12_000_000 // Gas the contract needs at entry, above the RPC gas cap
+		gasCap    = 10_000_000 // RPC gas cap
+		blockGas  = 30_000_000 // Block gas limit, above the cap
+	)
+	bankKey, err := crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
+	require.NoError(t, err)
+	var (
+		bank      = crypto.PubkeyToAddress(bankKey.PublicKey)
+		needsGas  = common.HexToAddress("0x000000000000000000000000000000000000c0de")
+		gasAtCall = common.HexToAddress("0x000000000000000000000000000000000000c0df")
+		burnsAll  = common.HexToAddress("0x000000000000000000000000000000000000c0e0")
+	)
+	m := execmoduletester.New(t, execmoduletester.WithKey(bankKey), execmoduletester.WithGenesisSpec(&types.Genesis{
+		Config:   chain.AllProtocolChanges,
+		GasLimit: blockGas,
+		Alloc: types.GenesisAlloc{
+			bank: {Balance: new(big.Int).Mul(big.NewInt(10), big.NewInt(1e18))},
+			// Returns the gas left at entry if it is at least threshold, reverts otherwise:
+			//   GAS PUSH4 threshold DUP2 LT PUSH1 0x11 JUMPI
+			//   PUSH0 MSTORE PUSH1 0x20 PUSH0 RETURN
+			//   JUMPDEST PUSH0 PUSH0 REVERT
+			needsGas: {Code: hexutil.MustDecode("0x5a6300b71b0081106011575f5260205ff35b5f5ffd"), Balance: new(big.Int)},
+			// Returns the gas left at entry: GAS PUSH0 MSTORE PUSH1 0x20 PUSH0 RETURN
+			gasAtCall: {Code: hexutil.MustDecode("0x5a5f5260205ff3"), Balance: new(big.Int)},
+			// Halts on an invalid opcode, which takes all its gas: INVALID
+			burnsAll: {Code: hexutil.MustDecode("0xfe"), Balance: new(big.Int)},
+		},
+	}))
+	api := newEthApiForTest(newBaseApiForTest(m), m.DB, nil, nil)
+	api.GasCap = gasCap
+	ctx := context.Background()
+	latest := rpc.BlockNumberOrHashWithNumber(rpc.LatestBlockNumber)
+	gasLeft := func(t *testing.T, ret []byte) uint64 {
+		t.Helper()
+		require.Len(t, ret, 32)
+		return new(uint256.Int).SetBytes(ret).Uint64()
+	}
+	explicit := hexutil.Uint64(20_000_000)
+	huge := hexutil.Uint64(1_000_000_000)
+	withGas := ethapi.CallArgs{From: &bank, To: &needsGas, Gas: &explicit}
+	withoutGas := ethapi.CallArgs{From: &bank, To: &gasAtCall}
+	withHugeGas := ethapi.CallArgs{From: &bank, To: &gasAtCall, Gas: &huge}
+
+	t.Run("eth_call", func(t *testing.T) {
+		// An explicit gas above the cap is allowed up to the block gas limit.
+		_, err := api.Call(ctx, withGas, &latest, nil, nil)
+		require.NoError(t, err)
+		// Without an explicit gas, the default stays the cap.
+		ret, err := api.Call(ctx, withoutGas, &latest, nil, nil)
+		require.NoError(t, err)
+		require.LessOrEqual(t, gasLeft(t, ret), uint64(gasCap))
+		// A larger block gas limit set through block overrides does not lift the cap.
+		ret, err = api.Call(ctx, withHugeGas, &latest, nil, &ethapi.BlockOverrides{GasLimit: &huge})
+		require.NoError(t, err)
+		require.LessOrEqual(t, gasLeft(t, ret), uint64(blockGas))
+	})
+	t.Run("eth_estimateGas", func(t *testing.T) {
+		// The search reaches the block gas limit.
+		gas, err := api.EstimateGas(ctx, &ethapi.CallArgs{From: &bank, To: &needsGas}, &latest, nil, nil)
+		require.NoError(t, err)
+		require.GreaterOrEqual(t, uint64(gas), uint64(threshold))
+		require.LessOrEqual(t, uint64(gas), uint64(blockGas))
+	})
+	t.Run("eth_simulateV1", func(t *testing.T) {
+		simulate := func(t *testing.T, blocks ...SimulatedBlock) []ethapi.CallResult {
+			t.Helper()
+			res, err := api.SimulateV1(ctx, SimulationRequest{BlockStateCalls: blocks}, latest)
+			require.NoError(t, err)
+			var calls []ethapi.CallResult
+			for _, block := range res {
+				calls = append(calls, block.Calls...)
+			}
+			for i, call := range calls {
+				require.Equal(t, hexutil.Uint64(types.ReceiptStatusSuccessful), call.Status, "call %d: %v", i, call.Error)
+			}
+			return calls
+		}
+		// An explicit gas above the cap is allowed up to the block gas limit.
+		simulate(t, SimulatedBlock{Calls: []ethapi.CallArgs{withGas}})
+		// Without an explicit gas, the default stays the cap.
+		calls := simulate(t, SimulatedBlock{Calls: []ethapi.CallArgs{withoutGas}})
+		require.LessOrEqual(t, gasLeft(t, hexutil.MustDecode(calls[0].ReturnData)), uint64(gasCap))
+		// A larger block gas limit set through block overrides does not lift the cap.
+		calls = simulate(t, SimulatedBlock{BlockOverrides: &ethapi.BlockOverrides{GasLimit: &huge}, Calls: []ethapi.CallArgs{withHugeGas}})
+		require.LessOrEqual(t, gasLeft(t, hexutil.MustDecode(calls[0].ReturnData)), uint64(blockGas))
+		// A call with an explicit gas above the cap takes its gas off the cap too, so a call
+		// without gas after it finds the cap used up.
+		burn := ethapi.CallArgs{From: &bank, To: &burnsAll, Gas: &explicit}
+		_, err := api.SimulateV1(ctx, SimulationRequest{BlockStateCalls: []SimulatedBlock{{Calls: []ethapi.CallArgs{burn, withoutGas}}}}, latest)
+		require.ErrorContains(t, err, protocol.ErrGasLimitReached.Error())
+	})
 }

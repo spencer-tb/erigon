@@ -299,6 +299,7 @@ type simulator struct {
 	blockReader       dbservices.FullBlockReader
 	logger            log.Logger
 	gasBudget         uint64
+	defaultGasBudget  uint64 // RPC gas cap without the block gas limit floor, bounds calls that omit gas
 	returnDataLimit   int
 	evmCallTimeout    time.Duration
 	commitmentHistory bool
@@ -328,6 +329,8 @@ func newSimulator(
 	// gas cap). Each call takes its receipt gas off it. Per-block gas limits are enforced
 	// separately via blockContext.GasLimit in sanitizeCall. This prevents DoS by bounding the
 	// total gas consumed across the entire simulation request.
+	// Calls with an explicit gas may use a budget floored at the gas limit of the base block,
+	// whose header has no block overrides applied. Calls that omit gas stay within the cap.
 	return &simulator{
 		base:              header,
 		chainConfig:       chainConfig,
@@ -336,7 +339,8 @@ func newSimulator(
 		txNumReader:       txNumReader,
 		blockReader:       blockReader,
 		logger:            logger,
-		gasBudget:         gasCap,
+		gasBudget:         effectiveGasCap(gasCap, header),
+		defaultGasBudget:  gasCap,
 		returnDataLimit:   returnDataLimit,
 		evmCallTimeout:    evmCallTimeout,
 		commitmentHistory: commitmentHistory,
@@ -1014,11 +1018,16 @@ func (s *simulator) simulateCall(
 	_, storeEVM, cleanup := setupEVMTimeout(ctx, s.evmCallTimeout)
 	defer cleanup()
 
+	// Calls that omit gas keep the RPC gas cap as their budget. Calls with an explicit gas may go
+	// past it, up to the block gas limit floor.
+	globalGasCap := s.gasBudget
+	if call.Gas == nil {
+		globalGasCap = s.defaultGasBudget
+	}
 	// A zero budget would read as no cap below.
-	if s.gasBudget == 0 {
+	if globalGasCap == 0 {
 		return nil, nil, nil, txValidationError(protocol.ErrGasLimitReached)
 	}
-	globalGasCap := s.gasBudget
 	// sanitizeCall fills zero dynamic fees when the block has a base fee, even one overridden
 	// before London; only the fields the caller named make a dynamic fee call.
 	dynamicFeeArgs := call.MaxFeePerGas != nil || call.MaxPriorityFeePerGas != nil
@@ -1080,6 +1089,7 @@ func (s *simulator) simulateCall(
 	}
 	gasUsed.AddResult(result)
 	s.gasBudget -= result.ReceiptGasUsed
+	s.defaultGasBudget -= min(result.ReceiptGasUsed, s.defaultGasBudget)
 	receipt := protocol.MakeReceipt(&header.Number, common.Hash{}, txn, gasUsed.Receipt, result, intraBlockState, evm)
 	gasUsed.Blob += receipt.BlobGasUsed
 
