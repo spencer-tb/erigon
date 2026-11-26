@@ -40,10 +40,12 @@ import (
 	"github.com/erigontech/erigon/common/hexutil"
 	"github.com/erigontech/erigon/common/log/v3"
 	"github.com/erigontech/erigon/common/math"
+	"github.com/erigontech/erigon/execution/builder/buildercfg"
 	"github.com/erigontech/erigon/execution/chain"
 	"github.com/erigontech/erigon/execution/commitment/trie"
 	enginetypes "github.com/erigontech/erigon/execution/engineapi/engine_types"
 	"github.com/erigontech/erigon/execution/tests/testforks"
+	"github.com/erigontech/erigon/execution/tests/testutil"
 	"github.com/erigontech/erigon/execution/types"
 	"github.com/erigontech/erigon/execution/types/accounts"
 	"github.com/erigontech/erigon/node/ethconfig"
@@ -109,6 +111,14 @@ func WithWarmupKzgCtxOnInit(warmup bool) EngineXTestRunnerOption {
 	}
 }
 
+// WithBuild makes the runner's testers serve the testing API, so that RunBuild
+// can build each test's valid payloads with the block builder.
+func WithBuild() EngineXTestRunnerOption {
+	return func(r *EngineXTestRunner) {
+		r.build = true
+	}
+}
+
 type EngineXTestRunner struct {
 	ctx                context.Context
 	logger             log.Logger
@@ -117,6 +127,7 @@ type EngineXTestRunner struct {
 	testers            map[testerGroupKey]testerGroup
 	profileHook        RequestProfileHook
 	warmupKzgCtxOnInit bool
+	build              bool
 }
 
 // RequestProfileHook is invoked immediately before each engine API request the
@@ -133,9 +144,17 @@ type RequestProfileHook func(kind, id string) (stop func())
 type testerEntry struct {
 	tester  EngineApiTester
 	dataDir string
+	// builderCfg and testing are set for a runner created WithBuild: the
+	// configuration the node's block builder reads on every build, and a
+	// client for the node's testing API.
+	builderCfg *buildercfg.BuilderConfig
+	testing    *rpc.Client
 }
 
 func (entry testerEntry) close() error {
+	if entry.testing != nil {
+		entry.testing.Close()
+	}
 	return errors.Join(entry.tester.Close(), dir.RemoveAll(entry.dataDir))
 }
 
@@ -355,18 +374,23 @@ func engineXStorageRoot(storage map[common.Hash]common.Hash) common.Hash {
 // Nodes start outside the cache lock so different fixture groups can start in
 // parallel. If two callers create the same tester, both use the first one cached.
 func (extr *EngineXTestRunner) getOrCreateTester(test EngineXTestDefinition) (EngineApiTester, error) {
+	entry, err := extr.getOrCreateEntry(test)
+	return entry.tester, err
+}
+
+func (extr *EngineXTestRunner) getOrCreateEntry(test EngineXTestDefinition) (testerEntry, error) {
 	groupKey := testerGroupKey{test.Fork, test.PreAllocHash}
 	listKey := test.accountListKey()
 	extr.mu.Lock()
 	if entry, ok := extr.testers[groupKey][listKey]; ok {
 		extr.mu.Unlock()
-		return entry.tester, nil
+		return entry, nil
 	}
 	extr.mu.Unlock()
 
 	entry, err := extr.createTester(test)
 	if err != nil {
-		return EngineApiTester{}, err
+		return testerEntry{}, err
 	}
 
 	extr.mu.Lock()
@@ -377,11 +401,11 @@ func (extr *EngineXTestRunner) getOrCreateTester(test EngineXTestDefinition) (En
 	} else if existing, ok := group[listKey]; ok {
 		extr.mu.Unlock()
 		_ = entry.close()
-		return existing.tester, nil
+		return existing, nil
 	}
 	group[listKey] = entry
 	extr.mu.Unlock()
-	return entry.tester, nil
+	return entry, nil
 }
 
 // createTester starts a tester in its own temporary directory. The caller
@@ -435,6 +459,7 @@ func (extr *EngineXTestRunner) createTester(test EngineXTestDefinition) (testerE
 		return testerEntry{}, fmt.Errorf("create temp data dir: %w", err)
 	}
 	engineApiClientTimeout := 10 * time.Minute
+	var builderCfg *buildercfg.BuilderConfig
 	tester, err := InitialiseEngineApiTester(extr.ctx, EngineApiTesterInitArgs{
 		Logger:                 extr.logger,
 		DataDir:                dataDir,
@@ -444,9 +469,13 @@ func (extr *EngineXTestRunner) createTester(test EngineXTestDefinition) (testerE
 		EthConfigTweaker: func(config *ethconfig.Config) {
 			config.MaxReorgDepth = 512
 			config.WarmupKzgCtxOnInit = extr.warmupKzgCtxOnInit
+			// The node's block builder keeps this pointer and reads the
+			// configuration on every build.
+			builderCfg = &config.Builder
 		},
-		DisableTxPool: true,
-		DisableSentry: true,
+		DisableTxPool:    true,
+		DisableSentry:    true,
+		EnableTestingAPI: extr.build,
 		// 8 GiB headroom for benchmark fixtures with large pre-alloc bytecode.
 		MdbxDBSizeLimit: 8 * datasize.GB,
 	})
@@ -457,7 +486,88 @@ func (extr *EngineXTestRunner) createTester(test EngineXTestDefinition) (testerE
 		_ = dir.RemoveAll(dataDir)
 		return testerEntry{}, fmt.Errorf("initialise tester for fork=%s preAlloc=%s: %w", fork, preAllocHash, err)
 	}
-	return testerEntry{tester: tester, dataDir: dataDir}, nil
+	entry := testerEntry{tester: tester, dataDir: dataDir}
+	if extr.build {
+		entry.builderCfg = builderCfg
+		entry.testing, err = rpc.DialContext(extr.ctx, tester.JsonRpcUrl, extr.logger)
+		if err != nil {
+			_ = entry.close()
+			return testerEntry{}, fmt.Errorf("dial testing API for fork=%s preAlloc=%s: %w", fork, preAllocHash, err)
+		}
+	}
+	return entry, nil
+}
+
+// A BuildOutcome is what RunBuild found for one test.
+type BuildOutcome struct {
+	// Built is the number of payloads the builder produced.
+	Built int
+	// Mismatches lists every field of a built payload that differs from the
+	// test's payload, in test order.
+	Mismatches []Mismatch
+	// Rejections lists every payload the client refused to build or to
+	// import, with the client's error.
+	Rejections []testutil.Rejection
+}
+
+// RunBuild runs test with every payload it expects to be valid first built by
+// the block builder, through testing_buildBlockV1 on the payload's parent, and
+// compared with the test's payload before the test's payload is imported.
+// Payloads the test expects to be invalid are skipped. A payload that fails to
+// import ends the test, since the next payload builds on it. The runner must
+// have been created WithBuild.
+func (extr *EngineXTestRunner) RunBuild(ctx context.Context, test EngineXTestDefinition) (BuildOutcome, error) {
+	outcome := BuildOutcome{Mismatches: []Mismatch{}, Rejections: []testutil.Rejection{}}
+	if !extr.build {
+		return outcome, errors.New("the runner was not created WithBuild")
+	}
+	entry, err := extr.getOrCreateEntry(test)
+	if err != nil {
+		return outcome, err
+	}
+	tester := entry.tester
+	name := testNameFromContext(ctx)
+	var fcuVersion string
+	if len(test.NewPayloads) > 0 {
+		fcuVersion = test.NewPayloads[0].FcuVersion
+	} else {
+		fcuVersion = fcuVersionFromTimestamp(tester.ChainConfig, tester.GenesisBlock.Time())
+	}
+	if err := processFcu(ctx, tester, tester.GenesisBlock.Hash(), fcuVersion, name, extr.profileHook); err != nil {
+		return outcome, fmt.Errorf("reset head to genesis: %w", err)
+	}
+	call := func(result any, method string, args ...any) error {
+		return entry.testing.CallContext(ctx, result, method, args...)
+	}
+	setGasLimit := func(gasLimit uint64) {
+		entry.builderCfg.GasLimit = &gasLimit
+	}
+	for i, payload := range test.NewPayloads {
+		if payload.ValidationError != "" || payload.ErrorCode != "" {
+			continue
+		}
+		mismatches, refused, err := buildAndCompare(call, setGasLimit, i, payload)
+		if err != nil {
+			return outcome, fmt.Errorf("payload %d: %w", i, err)
+		}
+		if refused != "" {
+			outcome.Rejections = append(outcome.Rejections, testutil.Rejection{Index: i, Error: refused})
+		} else {
+			outcome.Built++
+			outcome.Mismatches = append(outcome.Mismatches, mismatches...)
+		}
+		if err := processNewPayload(ctx, tester, payload, name, extr.profileHook); err != nil {
+			outcome.Rejections = append(outcome.Rejections, testutil.Rejection{Index: i, Error: err.Error()})
+			return outcome, fmt.Errorf("payload %d: %w", i, err)
+		}
+	}
+	if err := verifyEngineXResult(ctx, tester.RpcApiClient, test); err != nil {
+		return outcome, err
+	}
+	if len(outcome.Mismatches) > 0 || len(outcome.Rejections) > 0 {
+		return outcome, fmt.Errorf("%d mismatched fields, %d refused payloads", len(outcome.Mismatches), len(outcome.Rejections))
+	}
+	return outcome, nil
 }
 
 func processNewPayload(ctx context.Context, tester EngineApiTester, payload EngineXTestNewPayload, testName string, hook RequestProfileHook) error {

@@ -230,6 +230,7 @@ func init() {
 		&engineTestCommand,
 		&buildTestCommand,
 		&engineXTestCommand,
+		&buildXTestCommand,
 		&zkevmTestCommand,
 		&stateTestCommand,
 		&rlpTestCommand,

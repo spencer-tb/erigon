@@ -132,20 +132,41 @@ func (bt *BuildTest) deliverBuilt(m *execmoduletester.ExecModuleTester) error {
 // field in which it differs from the fixture's payload. A build the client
 // refuses is a rejection.
 func (bt *BuildTest) build(m *execmoduletester.ExecModuleTester, client *rpc.Client, index int, p EngineXTestNewPayload) error {
+	call := func(result any, method string, args ...any) error {
+		return client.CallContext(m.Ctx, result, method, args...)
+	}
+	mismatches, refused, err := buildAndCompare(call, m.SetBuilderGasLimit, index, p)
+	if err != nil {
+		return err
+	}
+	if refused != "" {
+		bt.Reject(index, nil, refused)
+		return nil
+	}
+	bt.Built++
+	bt.Mismatches = append(bt.Mismatches, mismatches...)
+	return nil
+}
+
+// buildAndCompare sets the builder's gas target and builds payload p's block on
+// its parent through testing_buildBlockV1 with call. It returns every field in
+// which the built payload differs from p, or the client's error when it
+// refuses to build.
+func buildAndCompare(call func(result any, method string, args ...any) error, setGasLimit func(uint64), index int, p EngineXTestNewPayload) ([]Mismatch, string, error) {
 	if len(p.Params) == 0 {
-		return errors.New("payload has no params")
+		return nil, "", errors.New("payload has no params")
 	}
 	var want enginetypes.ExecutionPayload
 	if err := json.Unmarshal(p.Params[0], &want); err != nil {
-		return err
+		return nil, "", err
 	}
 	newPayloadVersion, err := strconv.Atoi(p.NewPayloadVersion)
 	if err != nil {
-		return fmt.Errorf("newPayloadVersion %q: %w", p.NewPayloadVersion, err)
+		return nil, "", fmt.Errorf("newPayloadVersion %q: %w", p.NewPayloadVersion, err)
 	}
 	fcuVersion, err := strconv.Atoi(p.FcuVersion)
 	if err != nil {
-		return fmt.Errorf("forkchoiceUpdatedVersion %q: %w", p.FcuVersion, err)
+		return nil, "", fmt.Errorf("forkchoiceUpdatedVersion %q: %w", p.FcuVersion, err)
 	}
 	attributes := enginetypes.PayloadAttributes{
 		Timestamp:             want.Timestamp,
@@ -156,11 +177,11 @@ func (bt *BuildTest) build(m *execmoduletester.ExecModuleTester, client *rpc.Cli
 	// The parent beacon block root is a newPayload param from V3 on.
 	if newPayloadVersion >= 3 {
 		if len(p.Params) < 3 {
-			return errors.New("payload has no parentBeaconBlockRoot param")
+			return nil, "", errors.New("payload has no parentBeaconBlockRoot param")
 		}
 		var root common.Hash
 		if err := json.Unmarshal(p.Params[2], &root); err != nil {
-			return fmt.Errorf("parentBeaconBlockRoot: %w", err)
+			return nil, "", fmt.Errorf("parentBeaconBlockRoot: %w", err)
 		}
 		attributes.ParentBeaconBlockRoot = &root
 	}
@@ -172,48 +193,44 @@ func (bt *BuildTest) build(m *execmoduletester.ExecModuleTester, client *rpc.Cli
 		attributes.SlotNumber = want.SlotNumber
 		attributes.TargetGasLimit = &gasLimit
 	}
-	m.SetBuilderGasLimit(uint64(want.GasLimit))
+	setGasLimit(uint64(want.GasLimit))
 
 	var built enginetypes.GetPayloadResponse
-	err = client.CallContext(m.Ctx, &built, "testing_buildBlockV1", want.ParentHash, attributes, want.Transactions, want.ExtraData)
+	err = call(&built, "testing_buildBlockV1", want.ParentHash, attributes, want.Transactions, want.ExtraData)
 	var rpcErr rpc.Error
 	if errors.As(err, &rpcErr) {
-		bt.Reject(index, nil, rpcErrorString(rpcErr))
-		return nil
+		return nil, rpcErrorString(rpcErr), nil
 	}
 	if err != nil {
-		return err
+		return nil, "", err
 	}
-	bt.Built++
 
 	mismatches, err := fieldMismatches(index, &want, built.ExecutionPayload)
 	if err != nil {
-		return err
+		return nil, "", err
 	}
-	bt.Mismatches = append(bt.Mismatches, mismatches...)
-
 	// The execution requests are a newPayload param from V4 on.
 	if newPayloadVersion >= 4 {
 		if len(p.Params) < 4 {
-			return errors.New("payload has no executionRequests param")
+			return nil, "", errors.New("payload has no executionRequests param")
 		}
 		var wantRequests []hexutil.Bytes
 		if err := json.Unmarshal(p.Params[3], &wantRequests); err != nil {
-			return fmt.Errorf("executionRequests: %w", err)
+			return nil, "", fmt.Errorf("executionRequests: %w", err)
 		}
 		expected, err := json.Marshal(nonNil(wantRequests))
 		if err != nil {
-			return err
+			return nil, "", err
 		}
 		got, err := json.Marshal(nonNil(built.ExecutionRequests))
 		if err != nil {
-			return err
+			return nil, "", err
 		}
 		if !bytes.Equal(expected, got) {
-			bt.Mismatches = append(bt.Mismatches, Mismatch{Index: index, Field: "executionRequests", Expected: expected, Got: got})
+			mismatches = append(mismatches, Mismatch{Index: index, Field: "executionRequests", Expected: expected, Got: got})
 		}
 	}
-	return nil
+	return mismatches, "", nil
 }
 
 // fieldMismatches compares two execution payloads field by field in their JSON
