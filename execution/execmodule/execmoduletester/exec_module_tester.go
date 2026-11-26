@@ -63,6 +63,7 @@ import (
 	dbstate "github.com/erigontech/erigon/db/state"
 	"github.com/erigontech/erigon/db/state/execctx"
 	"github.com/erigontech/erigon/execution/builder"
+	"github.com/erigontech/erigon/execution/builder/buildercfg"
 	"github.com/erigontech/erigon/execution/chain"
 	"github.com/erigontech/erigon/execution/exec"
 	"github.com/erigontech/erigon/execution/execmodule"
@@ -154,6 +155,15 @@ type ExecModuleTester struct {
 	ReceiptsReader *receipts.Generator
 	posStagedSync  *stagedsync.Sync
 	bgComponentsEg errgroup.Group
+
+	// builderCfg is the configuration the block builder reads on every build.
+	builderCfg *buildercfg.BuilderConfig
+}
+
+// SetBuilderGasLimit sets the gas limit the block builder targets when the
+// build parameters name none, as they do before Amsterdam.
+func (emt *ExecModuleTester) SetBuilderGasLimit(gasLimit uint64) {
+	emt.builderCfg.GasLimit = &gasLimit
 }
 
 func (emt *ExecModuleTester) Close() {
@@ -799,6 +809,7 @@ func New(tb testing.TB, opts ...Option) *ExecModuleTester {
 		logger,
 	)
 	mock.BlockBuilder = blkBuilder
+	mock.builderCfg = &cfg.Builder
 
 	blockRetire := freezeblocks.NewBlockRetire(mock.Ctx, 1, dirs, mock.BlockReader, blockWriter, mock.DB, mock.ChainConfig, &cfg, mock.Notifications.Events, nil, logger)
 	mock.blockRetire = blockRetire

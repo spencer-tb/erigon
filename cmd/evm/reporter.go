@@ -28,6 +28,7 @@ import (
 	"github.com/urfave/cli/v3"
 
 	"github.com/erigontech/erigon/common"
+	"github.com/erigontech/erigon/execution/engineapi/engineapitester"
 	"github.com/erigontech/erigon/execution/state"
 	"github.com/erigontech/erigon/execution/tests/testutil"
 )
@@ -48,6 +49,11 @@ type testResult struct {
 	Rejections []testutil.Rejection `json:"rejections,omitzero"`
 	State      *state.Dump          `json:"state,omitempty"`
 	Stats      *execStats           `json:"benchStats,omitempty"`
+	// Built and Mismatches are set by buildtest: how many payloads the
+	// builder produced, and every field of a built payload that differs from
+	// the fixture's, empty when none does.
+	Built      *int                       `json:"built,omitempty"`
+	Mismatches []engineapitester.Mismatch `json:"mismatches,omitzero"`
 }
 
 func (r testResult) String() string {
