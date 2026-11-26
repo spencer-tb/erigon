@@ -893,7 +893,7 @@ func (e *EngineServer) getPayload(ctx context.Context, payloadId uint64, version
 		return nil, &rpc.UnsupportedForkError{Message: "Unsupported fork"}
 	}
 
-	payload, err := assembledBlockToPayloadResponse(br, assembled.BlockValue, version)
+	payload, err := assembledBlockToPayloadResponse(br, assembled.BlockValue, version, true)
 	if err != nil {
 		return nil, err
 	}
@@ -1326,16 +1326,22 @@ func convertGrpcStatusToEngineStatus(status execmodule.ExecutionStatus) engine_t
 }
 
 // assembledBlockToPayloadResponse converts a native assembled block to an engine-API payload response.
-func assembledBlockToPayloadResponse(br *types.BlockWithReceipts, blockValue *uint256.Int, version clparams.StateVersion) (*engine_types.GetPayloadResponse, error) {
+// Without requireSidecars, a blob transaction that came without its sidecar, as
+// a testing payload's can, is left out of the blobs bundle instead of failing.
+func assembledBlockToPayloadResponse(br *types.BlockWithReceipts, blockValue *uint256.Int, version clparams.StateVersion, requireSidecars bool) (*engine_types.GetPayloadResponse, error) {
 	block := br.Block
 	ep, err := engine_types.ExecutionPayloadFromBlock(block)
 	if err != nil {
 		return nil, err
 	}
 
-	blobsBundle, err := engine_types.BlobsBundleFromTransactions(block.Transactions())
-	if err != nil {
-		return nil, err
+	var blobsBundle *engine_types.BlobsBundle
+	if requireSidecars {
+		if blobsBundle, err = engine_types.BlobsBundleFromTransactions(block.Transactions()); err != nil {
+			return nil, err
+		}
+	} else {
+		blobsBundle = engine_types.BlobsBundleFromAvailableSidecars(block.Transactions())
 	}
 
 	var executionRequests []hexutil.Bytes

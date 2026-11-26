@@ -88,6 +88,18 @@ type BlobsBundle struct {
 // BlobsBundleFromTransactions builds a BlobsBundle by extracting blobs,
 // commitments, and proofs from blob transactions in the given list.
 func BlobsBundleFromTransactions(txs types.Transactions) (*BlobsBundle, error) {
+	return blobsBundleFromTransactions(txs, true)
+}
+
+// BlobsBundleFromAvailableSidecars builds a BlobsBundle from the blob
+// transactions that carry their sidecar, skipping those that come without one,
+// as the transactions of a testing payload taken from a block do.
+func BlobsBundleFromAvailableSidecars(txs types.Transactions) *BlobsBundle {
+	bundle, _ := blobsBundleFromTransactions(txs, false)
+	return bundle
+}
+
+func blobsBundleFromTransactions(txs types.Transactions, requireSidecars bool) (*BlobsBundle, error) {
 	bundle := &BlobsBundle{
 		Commitments: make([]hexutil.Bytes, 0),
 		Proofs:      make([]hexutil.Bytes, 0),
@@ -106,6 +118,9 @@ func BlobsBundleFromTransactions(txs types.Transactions) (*BlobsBundle, error) {
 		case *types.FrameTxWrapper:
 			blobs, commitments, proofs = tx.Blobs, tx.Commitments, tx.Proofs
 		default:
+			if !requireSidecars {
+				continue
+			}
 			return nil, fmt.Errorf("missing blob sidecar for tx %d (%T)", i, txn)
 		}
 		for _, c := range commitments {

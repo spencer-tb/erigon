@@ -131,7 +131,9 @@ func (t *testingImpl) BuildBlockV1(
 		return nil, err
 	}
 
-	response, err := assembledBlockToPayloadResponse(assembled.Block, assembled.BlockValue, version)
+	// The given transactions come as a block carries them, so a blob transaction
+	// may come without its sidecar, and its blobs are then left out of the bundle.
+	response, err := assembledBlockToPayloadResponse(assembled.Block, assembled.BlockValue, version, false)
 	if err != nil {
 		return nil, err
 	}
