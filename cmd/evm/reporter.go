@@ -49,9 +49,9 @@ type testResult struct {
 	Rejections []testutil.Rejection `json:"rejections,omitzero"`
 	State      *state.Dump          `json:"state,omitempty"`
 	Stats      *execStats           `json:"benchStats,omitempty"`
-	// Built and Mismatches are set by buildtest: how many payloads the
-	// builder produced, and every field of a built payload that differs from
-	// the fixture's, empty when none does.
+	// Built and Mismatches are set by buildtest and buildxtest: how many
+	// payloads the builder produced, and every field of the fixture's payload
+	// in which a built one differs, empty when none does.
 	Built      *int                       `json:"built,omitempty"`
 	Mismatches []engineapitester.Mismatch `json:"mismatches,omitzero"`
 }

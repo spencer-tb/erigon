@@ -161,9 +161,10 @@ type ExecModuleTester struct {
 }
 
 // SetBuilderGasLimit sets the gas limit the block builder targets when the
-// build parameters name none, as they do before Amsterdam.
-func (emt *ExecModuleTester) SetBuilderGasLimit(gasLimit uint64) {
-	emt.builderCfg.GasLimit = &gasLimit
+// build parameters name none, as they do before Amsterdam. nil restores the
+// default, which keeps the parent's gas limit.
+func (emt *ExecModuleTester) SetBuilderGasLimit(gasLimit *uint64) {
+	emt.builderCfg.GasLimit = gasLimit
 }
 
 func (emt *ExecModuleTester) Close() {

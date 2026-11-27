@@ -47,8 +47,8 @@ func runBuildXTestCmd(t *testing.T, path string) (int, testResult) {
 	return tt.ExitStatus(), results[0]
 }
 
-// buildxtest builds a test's valid payloads on the node its pre-alloc group
-// shares and compares them with the fixture's.
+// buildxtest builds a test's valid payloads on the node of its pre-alloc
+// group and compares them with the fixture's.
 func TestBuildXTestBuildsValidPayloads(t *testing.T) {
 	if testing.Short() {
 		t.Skip("too slow for testing.Short")

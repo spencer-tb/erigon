@@ -331,7 +331,11 @@ func runFixtures(ctx *cli.Command, fname string, filter testFilter, reportPath f
 			if dec.InputOffset() == start {
 				return err // a syntax error: the decoder cannot move on to the next fixture
 			}
-			results = append(results, unreadableFixture(name, err))
+			result := unreadableFixture(name, err)
+			if _, ok := test.(builtFixture); ok {
+				result.Built, result.Mismatches = new(int), []engineapitester.Mismatch{}
+			}
+			results = append(results, result)
 			unreadable = append(unreadable, fmt.Errorf("fixture %s: %w", name, err))
 			return nil
 		}

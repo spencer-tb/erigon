@@ -102,3 +102,24 @@ func TestBuildTestReportsMismatch(t *testing.T) {
 	require.Len(t, res.Rejections, 1)
 	require.Equal(t, 0, res.Rejections[0].Index)
 }
+
+// A mismatch alone fails a fixture whose payload still imports: a field the
+// payload decoding ignores but the comparison reads.
+func TestBuildTestFailsOnAMismatchAlone(t *testing.T) {
+	if testing.Short() {
+		t.Skip("too slow for testing.Short")
+	}
+	path := writeEditedFixture(t, "../../execution/tests/testdata/engine/bal_cross_block_ripemd160_state_leak.json", func(fixture map[string]any) {
+		enginePayloadParams(fixture, 0)["unknownField"] = "0x01"
+	})
+	status, res := runBuildTestCmd(t, path)
+	require.Equal(t, exitFailedRun, status)
+	require.False(t, res.Pass)
+	require.Empty(t, res.Rejections)
+	require.Equal(t, []engineapitester.Mismatch{{
+		Index:    0,
+		Field:    "unknownField",
+		Expected: json.RawMessage(`"0x01"`),
+		Got:      json.RawMessage("null"),
+	}}, res.Mismatches)
+}

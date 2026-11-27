@@ -144,11 +144,13 @@ type RequestProfileHook func(kind, id string) (stop func())
 type testerEntry struct {
 	tester  EngineApiTester
 	dataDir string
-	// builderCfg and testing are set for a runner created WithBuild: the
-	// configuration the node's block builder reads on every build, and a
-	// client for the node's testing API.
-	builderCfg *buildercfg.BuilderConfig
-	testing    *rpc.Client
+	// builderCfg, defaultGasLimit and testing are set for a runner created
+	// WithBuild: the configuration the node's block builder reads on every
+	// build, the gas limit it targets by default, and a client for the node's
+	// testing API.
+	builderCfg      *buildercfg.BuilderConfig
+	defaultGasLimit *uint64
+	testing         *rpc.Client
 }
 
 func (entry testerEntry) close() error {
@@ -489,6 +491,7 @@ func (extr *EngineXTestRunner) createTester(test EngineXTestDefinition) (testerE
 	entry := testerEntry{tester: tester, dataDir: dataDir}
 	if extr.build {
 		entry.builderCfg = builderCfg
+		entry.defaultGasLimit = builderCfg.GasLimit
 		entry.testing, err = rpc.DialContext(extr.ctx, tester.JsonRpcUrl, extr.logger)
 		if err != nil {
 			_ = entry.close()
@@ -502,8 +505,8 @@ func (extr *EngineXTestRunner) createTester(test EngineXTestDefinition) (testerE
 type BuildOutcome struct {
 	// Built is the number of payloads the builder produced.
 	Built int
-	// Mismatches lists every field of a built payload that differs from the
-	// test's payload, in test order.
+	// Mismatches lists every field of the test's payload in which a built
+	// payload differs, in test order.
 	Mismatches []Mismatch
 	// Rejections lists every payload the client refused to build or to
 	// import, with the client's error.
@@ -539,8 +542,11 @@ func (extr *EngineXTestRunner) RunBuild(ctx context.Context, test EngineXTestDef
 	call := func(result any, method string, args ...any) error {
 		return entry.testing.CallContext(ctx, result, method, args...)
 	}
-	setGasLimit := func(gasLimit uint64) {
-		entry.builderCfg.GasLimit = &gasLimit
+	setGasLimit := func(gasLimit *uint64) {
+		if gasLimit == nil {
+			gasLimit = entry.defaultGasLimit
+		}
+		entry.builderCfg.GasLimit = gasLimit
 	}
 	for i, payload := range test.NewPayloads {
 		if payload.ValidationError != "" || payload.ErrorCode != "" {
@@ -557,7 +563,16 @@ func (extr *EngineXTestRunner) RunBuild(ctx context.Context, test EngineXTestDef
 			outcome.Mismatches = append(outcome.Mismatches, mismatches...)
 		}
 		if err := processNewPayload(ctx, tester, payload, name, extr.profileHook); err != nil {
-			outcome.Rejections = append(outcome.Rejections, testutil.Rejection{Index: i, Error: err.Error()})
+			// Only the client's own answers are rejections, a JSON-RPC error or
+			// an INVALID status. Anything else is the runner's failure.
+			var rpcErr rpc.Error
+			var statusErr *payloadStatusError
+			switch {
+			case errors.As(err, &rpcErr):
+				outcome.Rejections = append(outcome.Rejections, testutil.Rejection{Index: i, Error: rpcErrorString(rpcErr)})
+			case errors.As(err, &statusErr) && statusErr.status.Status == enginetypes.InvalidStatus:
+				outcome.Rejections = append(outcome.Rejections, testutil.Rejection{Index: i, Hash: payloadHash(payload), Error: statusErrorString(statusErr.status)})
+			}
 			return outcome, fmt.Errorf("payload %d: %w", i, err)
 		}
 	}
@@ -638,7 +653,7 @@ func processNewPayload(ctx context.Context, tester EngineApiTester, payload Engi
 		if expectFailure {
 			return nil
 		}
-		return fmt.Errorf("payload status is not valid: %s", enginePayloadStatus.Status)
+		return &payloadStatusError{enginePayloadStatus}
 	}
 	if expectFailure {
 		return fmt.Errorf("expected payload to fail (validationError=%q errorCode=%q) but status was Valid", payload.ValidationError, payload.ErrorCode)
@@ -658,6 +673,27 @@ func beginProfile(hook RequestProfileHook, kind, testName, suffix string) func()
 		id = testName + "__" + suffix
 	}
 	return hook(kind, id)
+}
+
+// payloadStatusError is a newPayload answered with a status other than VALID.
+type payloadStatusError struct {
+	status *enginetypes.PayloadStatus
+}
+
+func (e *payloadStatusError) Error() string {
+	return fmt.Sprintf("payload status is not valid: %s", e.status.Status)
+}
+
+// payloadHash returns the block hash payload p names, or nil when it names
+// none.
+func payloadHash(p EngineXTestNewPayload) *common.Hash {
+	var payload struct {
+		BlockHash *common.Hash `json:"blockHash"`
+	}
+	if len(p.Params) == 0 || json.Unmarshal(p.Params[0], &payload) != nil {
+		return nil
+	}
+	return payload.BlockHash
 }
 
 func processFcu(ctx context.Context, tester EngineApiTester, head common.Hash, version string, testName string, hook RequestProfileHook) error {
