@@ -1768,7 +1768,7 @@ func signedElectraPayload(t *testing.T, config *chain.Config) (*engine_types.Exe
 		RequestsHash:          types.FlatRequests{}.Hash(),
 	}
 	block := types.NewBlock(header, []types.Transaction{txn}, nil, nil, []*types.Withdrawal{}, nil)
-	resp, err := assembledBlockToPayloadResponse(&types.BlockWithReceipts{Block: block, Requests: types.FlatRequests{}}, uint256.NewInt(0), clparams.ElectraVersion)
+	resp, err := assembledBlockToPayloadResponse(&types.BlockWithReceipts{Block: block, Requests: types.FlatRequests{}}, uint256.NewInt(0), clparams.ElectraVersion, true)
 	require.NoError(t, err)
 	resp.ExecutionPayload.Withdrawals = []*types.Withdrawal{}
 	return resp.ExecutionPayload, crypto.PubkeyToAddress(key.PublicKey)

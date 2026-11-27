@@ -68,7 +68,7 @@ func TestRunEngineXGroupReturnsAReadError(t *testing.T) {
 	defer runner.Close()
 	missing := engineXNamedTest{name: "gone", file: filepath.Join(t.TempDir(), "gone.json"), size: 2}
 	resultCh := make(chan testResult, 1)
-	err = runEngineXGroup(context.Background(), runner, engineXGroupKey{}, []engineXNamedTest{missing}, false, resultCh)
+	err = runEngineXGroup(context.Background(), runner, engineXGroupKey{}, []engineXNamedTest{missing}, false, false, resultCh)
 	require.Error(t, err)
 	require.False(t, (<-resultCh).Pass)
 }

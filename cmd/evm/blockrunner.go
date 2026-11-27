@@ -36,6 +36,7 @@ import (
 
 	"github.com/erigontech/erigon/common/dbg"
 	"github.com/erigontech/erigon/common/log/v3"
+	"github.com/erigontech/erigon/execution/engineapi/engineapitester"
 	"github.com/erigontech/erigon/execution/tests/testutil"
 	"github.com/erigontech/erigon/node/ethconfig"
 )
@@ -307,6 +308,12 @@ type fixture interface {
 	RunCLI() error
 }
 
+// A builtFixture is a fixture whose payloads are also built, and reports how
+// many it built and how the built payloads differ from its own.
+type builtFixture interface {
+	BuildResult() (int, []engineapitester.Mismatch)
+}
+
 // runFixtures runs the fixtures in fname, each decoded into a new fixture from
 // newTest. Its error names a fixture that cannot be decoded, which also gets a
 // failed result, or the file itself.
@@ -324,7 +331,11 @@ func runFixtures(ctx *cli.Command, fname string, filter testFilter, reportPath f
 			if dec.InputOffset() == start {
 				return err // a syntax error: the decoder cannot move on to the next fixture
 			}
-			results = append(results, unreadableFixture(name, err))
+			result := unreadableFixture(name, err)
+			if _, ok := test.(builtFixture); ok {
+				result.Built, result.Mismatches = new(int), []engineapitester.Mismatch{}
+			}
+			results = append(results, result)
 			unreadable = append(unreadable, fmt.Errorf("fixture %s: %w", name, err))
 			return nil
 		}
@@ -339,6 +350,10 @@ func runFixtures(ctx *cli.Command, fname string, filter testFilter, reportPath f
 			result.Error = err.Error()
 		}
 		result.Rejections = bt.Rejections
+		if b, ok := test.(builtFixture); ok {
+			built, mismatches := b.BuildResult()
+			result.Built, result.Mismatches = &built, mismatches
+		}
 		results = append(results, result)
 		return nil
 	})

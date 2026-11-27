@@ -114,28 +114,70 @@ type engineXGroupKey struct {
 	hash engineapitester.PreAllocHash
 }
 
+var buildXTestCommand = cli.Command{
+	Action:    buildXTestCmd,
+	Name:      "buildxtest",
+	Usage:     "Builds the valid payloads of the given engine-x test fixtures with the block builder and compares them with the fixtures",
+	ArgsUsage: "<path>",
+	Description: "Tests share a short-lived Erigon node as in enginextest. Every payload a\n" +
+		"test expects to be valid is first built by the node's block builder,\n" +
+		"through testing_buildBlockV1 on the payload's parent, and compared with\n" +
+		"the fixture's before the fixture's payload is imported. Payloads a test\n" +
+		"expects to be invalid are skipped.",
+	Flags: []cli.Flag{
+		&cli.StringFlag{
+			Name:     "pre-alloc-dir",
+			Usage:    "Directory containing engine-x pre-alloc JSON files",
+			Required: true,
+		},
+		&JSONOutputFlag,
+		&RunFlag,
+		&VerbosityFlag,
+		&WorkersFlag,
+	},
+}
+
 func engineXTestCmd(ctx context.Context, cliCtx *cli.Command) error {
+	return runEngineXCommand(ctx, cliCtx, false)
+}
+
+func buildXTestCmd(ctx context.Context, cliCtx *cli.Command) error {
+	return runEngineXCommand(ctx, cliCtx, true)
+}
+
+// runEngineXCommand runs enginextest, or buildxtest when build is set.
+func runEngineXCommand(ctx context.Context, cliCtx *cli.Command, build bool) error {
 	if cliCtx.Int(VerbosityFlag.Name) > 0 {
 		log.Root().SetHandler(log.LvlFilterHandler(log.Lvl(cliCtx.Int(VerbosityFlag.Name)), log.StderrHandler))
 	} else {
 		log.Root().SetHandler(log.LvlFilterHandler(log.LvlError, log.StderrHandler))
 	}
 
+	// buildxtest exits 2 for input it could not run, as buildtest does.
+	incomplete := func(err error) error {
+		if build {
+			return exitIncomplete(err)
+		}
+		return err
+	}
 	path := cliCtx.Args().First()
 	if path == "" {
-		return errors.New("path argument required")
+		return incomplete(errors.New("path argument required"))
+	}
+	if build && cliCtx.Args().Len() > 1 {
+		return incomplete(fmt.Errorf("buildxtest takes one fixtures path, got %d", cliCtx.Args().Len()))
 	}
 	preAllocDir := cliCtx.String("pre-alloc-dir")
 	if preAllocDir == "" {
-		return errors.New("--pre-alloc-dir is required")
+		return incomplete(errors.New("--pre-alloc-dir is required"))
 	}
 	re, err := regexp.Compile(cliCtx.String(RunFlag.Name))
 	if err != nil {
-		return fmt.Errorf("invalid --run regex: %w", err)
+		return incomplete(fmt.Errorf("invalid --run regex: %w", err))
 	}
 	workers := cliCtx.Uint64(WorkersFlag.Name)
 	if workers == 0 {
-		return fmt.Errorf("--%s must be >= 1", WorkersFlag.Name)
+		return incomplete(fmt.Errorf("--%s must be >= 1", WorkersFlag.Name))
 	}
 	cpuProfileDir := cliCtx.String("pprof.cpu")
 	wallProfileDir := cliCtx.String("fgprof")
@@ -143,7 +185,7 @@ func engineXTestCmd(ctx context.Context, cliCtx *cli.Command) error {
 	if profilingEnabled && workers > 1 {
 		// pprof.StartCPUProfile and fgprof.Start are process-global, so
 		// concurrent workers cannot produce isolated per-request profiles.
-		return fmt.Errorf("--pprof.cpu/--fgprof require --workers=1 (got %d)", workers)
+		return incomplete(fmt.Errorf("--pprof.cpu/--fgprof require --workers=1 (got %d)", workers))
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -151,7 +193,7 @@ func engineXTestCmd(ctx context.Context, cliCtx *cli.Command) error {
 
 	groups, totalTests, err := loadEngineXGroups(path, re)
 	if err != nil {
-		return err
+		return incomplete(err)
 	}
 	if workers > uint64(len(groups)) && len(groups) > 0 {
 		workers = uint64(len(groups))
@@ -159,13 +201,20 @@ func engineXTestCmd(ctx context.Context, cliCtx *cli.Command) error {
 	fmt.Fprintf(os.Stderr, "Collected %d tests across %d (fork, preAllocHash) groups; running with %d workers\n", totalTests, len(groups), workers)
 
 	if totalTests == 0 {
-		report(cliCtx, nil)
+		if build {
+			report(cliCtx, []testResult{})
+		} else {
+			report(cliCtx, nil)
+		}
 		return nil
 	}
 
 	runnerOpts := []engineapitester.EngineXTestRunnerOption{
 		// needed for benchmarks, to reproduce real-life node startup
 		engineapitester.WithWarmupKzgCtxOnInit(true),
+	}
+	if build {
+		runnerOpts = append(runnerOpts, engineapitester.WithBuild())
 	}
 	if profilingEnabled {
 		if cpuProfileDir != "" {
@@ -185,7 +234,7 @@ func engineXTestCmd(ctx context.Context, cliCtx *cli.Command) error {
 
 	runner, err := engineapitester.NewEngineXTestRunner(ctx, log.Root(), preAllocDir, runnerOpts...)
 	if err != nil {
-		return fmt.Errorf("create runner: %w", err)
+		return incomplete(fmt.Errorf("create runner: %w", err))
 	}
 	defer func() {
 		cerr := runner.Close()
@@ -211,7 +260,7 @@ func engineXTestCmd(ctx context.Context, cliCtx *cli.Command) error {
 	for w := uint64(0); w < workers; w++ {
 		wg.Go(func() {
 			for key := range groupCh {
-				if err := runEngineXGroup(ctx, runner, key, groups[key], timeIt, resultCh); err != nil {
+				if err := runEngineXGroup(ctx, runner, key, groups[key], timeIt, build, resultCh); err != nil {
 					readMu.Lock()
 					readErrs = append(readErrs, err)
 					readMu.Unlock()
@@ -246,6 +295,17 @@ func engineXTestCmd(ctx context.Context, cliCtx *cli.Command) error {
 	report(cliCtx, results)
 	if timeIt {
 		printTimings(results)
+	}
+	if build {
+		// buildxtest exits as buildtest does: 2 for input it could not run,
+		// else 1 when a test failed.
+		if err := errors.Join(readErrs...); err != nil {
+			return exitIncomplete(err)
+		}
+		if anyFailed(results) {
+			return cli.Exit("", exitFailedRun)
+		}
+		return nil
 	}
 	return errors.Join(readErrs...)
 }
@@ -343,6 +403,7 @@ func runEngineXGroup(
 	key engineXGroupKey,
 	tests []engineXNamedTest,
 	timeIt bool,
+	build bool,
 	resultCh chan<- testResult,
 ) (readErr error) {
 	defer func() {
@@ -364,7 +425,16 @@ func runEngineXGroup(
 		if err != nil && readErr == nil {
 			readErr = fmt.Errorf("test %s: %w", t.name, err)
 		}
-		if err == nil && timeIt {
+		switch {
+		case err != nil:
+			if build {
+				r.Built, r.Mismatches = new(int), []engineapitester.Mismatch{}
+			}
+		case build:
+			var outcome engineapitester.BuildOutcome
+			outcome, err = runner.RunBuild(testCtx, def)
+			r.Built, r.Mismatches, r.Rejections = &outcome.Built, outcome.Mismatches, outcome.Rejections
+		case timeIt:
 			var stats execStats
 			_, stats, err = timedExec(false, func() ([]byte, uint64, error) {
 				return nil, 0, runner.Run(testCtx, def)
@@ -372,7 +442,7 @@ func runEngineXGroup(
 			if err == nil {
 				r.Stats = &stats
 			}
-		} else if err == nil {
+		default:
 			err = runner.Run(testCtx, def)
 		}
 		if err != nil {
